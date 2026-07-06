@@ -1,4 +1,3 @@
-import os
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -10,40 +9,23 @@ from google.analytics.data_v1beta.types import (
     Dimension,
     Metric,
     RunReportRequest,
+    Filter,
     FilterExpression,
     FilterExpressionList,
-    Filter,
 )
 from googleapiclient.discovery import build
 
-
-APP_NAME = "antivirus-vibrant-soft"
-PROPERTY_ID = os.getenv("GA4_PROPERTY_ID", "504100281")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME = "GA4 Basic Funnel"
-
-START_DATE = "30daysAgo"
-END_DATE = "today"
-
-HOME_SCREEN_NAME = os.getenv("HOME_SCREEN_NAME") or "Home"
+from config import SCOPES, load_config
 
 
-SCOPES = [
-    "https://www.googleapis.com/auth/analytics.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+config = load_config()
 
 
 def get_credentials():
-    service_account_json = os.getenv("GA4_SERVICE_ACCOUNT_JSON")
-
-    if not service_account_json:
-        raise ValueError("Missing GitHub secret: GA4_SERVICE_ACCOUNT_JSON")
-
-    info = json.loads(service_account_json)
+    service_account_info = json.loads(config.service_account_json)
 
     return service_account.Credentials.from_service_account_info(
-        info,
+        service_account_info,
         scopes=SCOPES,
     )
 
@@ -51,7 +33,7 @@ def get_credentials():
 credentials = get_credentials()
 
 
-def exact_filter(field_name, value):
+def exact_filter(field_name: str, value: str) -> FilterExpression:
     return FilterExpression(
         filter=Filter(
             field_name=field_name,
@@ -64,7 +46,7 @@ def exact_filter(field_name, value):
     )
 
 
-def contains_filter(field_name, value):
+def contains_filter(field_name: str, value: str) -> FilterExpression:
     return FilterExpression(
         filter=Filter(
             field_name=field_name,
@@ -77,7 +59,7 @@ def contains_filter(field_name, value):
     )
 
 
-def get_ga4_step_data(event_name, screen_name=None):
+def get_ga4_step_data(event_name: str, screen_name: str | None = None) -> dict:
     client = BetaAnalyticsDataClient(credentials=credentials)
 
     filters = [
@@ -85,22 +67,29 @@ def get_ga4_step_data(event_name, screen_name=None):
     ]
 
     if screen_name:
-        filters.append(contains_filter("unifiedScreenName", screen_name))
+        filters.append(
+            contains_filter(config.screen_field, screen_name)
+        )
 
     request = RunReportRequest(
-        property=f"properties/{PROPERTY_ID}",
+        property=f"properties/{config.property_id}",
         date_ranges=[
-            DateRange(start_date=START_DATE, end_date=END_DATE)
+            DateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
         ],
         dimensions=[
-            Dimension(name="eventName")
+            Dimension(name="eventName"),
         ],
         metrics=[
             Metric(name="activeUsers"),
             Metric(name="eventCount"),
         ],
         dimension_filter=FilterExpression(
-            and_group=FilterExpressionList(expressions=filters)
+            and_group=FilterExpressionList(
+                expressions=filters
+            )
         ),
     )
 
@@ -115,18 +104,23 @@ def get_ga4_step_data(event_name, screen_name=None):
     row = response.rows[0]
 
     return {
-        "active_users": row.metric_values[0].value,
-        "event_count": row.metric_values[1].value,
+        "active_users": int(row.metric_values[0].value or 0),
+        "event_count": int(row.metric_values[1].value or 0),
     }
 
 
 def get_sheets_service():
-    return build("sheets", "v4", credentials=credentials)
+    return build(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
 
 
 def ensure_sheet_exists(service):
     spreadsheet = service.spreadsheets().get(
-        spreadsheetId=SPREADSHEET_ID
+        spreadsheetId=config.spreadsheet_id
     ).execute()
 
     existing_sheets = [
@@ -134,15 +128,15 @@ def ensure_sheet_exists(service):
         for sheet in spreadsheet.get("sheets", [])
     ]
 
-    if SHEET_NAME not in existing_sheets:
+    if config.sheet_name not in existing_sheets:
         service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
+            spreadsheetId=config.spreadsheet_id,
             body={
                 "requests": [
                     {
                         "addSheet": {
                             "properties": {
-                                "title": SHEET_NAME
+                                "title": config.sheet_name
                             }
                         }
                     }
@@ -151,40 +145,45 @@ def ensure_sheet_exists(service):
         ).execute()
 
 
-def write_rows_to_sheet(rows):
-    if not SPREADSHEET_ID:
-        raise ValueError("Missing GitHub secret: SPREADSHEET_ID")
-
+def write_rows_to_sheet(rows: list[list]):
     service = get_sheets_service()
     ensure_sheet_exists(service)
 
     service.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A:Z",
+        spreadsheetId=config.spreadsheet_id,
+        range=f"{config.sheet_name}!A:Z",
         body={},
     ).execute()
 
     service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A1",
+        spreadsheetId=config.spreadsheet_id,
+        range=f"{config.sheet_name}!A1",
         valueInputOption="USER_ENTERED",
-        body={"values": rows},
+        body={
+            "values": rows
+        },
     ).execute()
 
 
-def main():
-    first_open_data = get_ga4_step_data("first_open")
+def calculate_rate(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0%"
 
-    home_users_data = get_ga4_step_data(
-        event_name="screen_view",
-        screen_name=HOME_SCREEN_NAME,
-    )
+    return f"{round((numerator / denominator) * 100, 2)}%"
+
+
+def build_rows(first_open_data: dict, home_users_data: dict) -> list[list]:
+    first_open_users = first_open_data["active_users"]
+    home_users = home_users_data["active_users"]
+
+    drop_off = max(first_open_users - home_users, 0)
+    conversion_rate = calculate_rate(home_users, first_open_users)
 
     updated_at = datetime.now(
-        ZoneInfo("Asia/Karachi")
-    ).strftime("%Y-%m-%d %I:%M:%S %p PKT")
+        ZoneInfo(config.timezone)
+    ).strftime("%Y-%m-%d %I:%M:%S %p")
 
-    rows = [
+    return [
         [
             "App Name",
             "Property ID",
@@ -194,35 +193,63 @@ def main():
             "Screen Condition",
             "Active Users",
             "Event Count",
+            "Drop Off",
+            "Step Conversion Rate",
             "Updated At",
         ],
         [
-            APP_NAME,
-            PROPERTY_ID,
-            f"{START_DATE} to {END_DATE}",
+            config.app_name,
+            config.property_id,
+            f"{config.start_date} to {config.end_date}",
             "Step 1 - First Open",
             "first_open",
             "",
             first_open_data["active_users"],
             first_open_data["event_count"],
+            "",
+            "",
             updated_at,
         ],
         [
-            APP_NAME,
-            PROPERTY_ID,
-            f"{START_DATE} to {END_DATE}",
+            config.app_name,
+            config.property_id,
+            f"{config.start_date} to {config.end_date}",
             "Step 2 - Home Users",
             "screen_view",
-            f"unifiedScreenName contains {HOME_SCREEN_NAME}",
+            f"{config.screen_field} contains {config.home_screen_name}",
             home_users_data["active_users"],
             home_users_data["event_count"],
+            drop_off,
+            conversion_rate,
             updated_at,
         ],
     ]
 
+
+def main():
+    print("Reading GA4 data...")
+
+    first_open_data = get_ga4_step_data(
+        event_name="first_open"
+    )
+
+    home_users_data = get_ga4_step_data(
+        event_name="screen_view",
+        screen_name=config.home_screen_name,
+    )
+
+    rows = build_rows(
+        first_open_data=first_open_data,
+        home_users_data=home_users_data,
+    )
+
     write_rows_to_sheet(rows)
 
-    print("GA4 data written successfully to Google Sheet.")
+    print("Done. GA4 data written to Google Sheet.")
+    print(f"App Name: {config.app_name}")
+    print(f"Property ID: {config.property_id}")
+    print(f"Home Screen: {config.home_screen_name}")
+    print(f"Screen Field: {config.screen_field}")
 
 
 if __name__ == "__main__":
