@@ -45,6 +45,7 @@ class Config:
     details_sheet: str
     user_session_sheet: str
     retention_details_sheet: str
+    notification_daily_sheet: str
 
     start_date: str
     end_date: str
@@ -54,6 +55,7 @@ class Config:
     default_screen_field: str
 
     retention_days: int
+    notification_events: str
 
 
 def load_config() -> Config:
@@ -66,6 +68,7 @@ def load_config() -> Config:
         details_sheet=optional_env("DETAILS_SHEET", "GA4 Funnel Details"),
         user_session_sheet=optional_env("USER_SESSION_SHEET", "GA4 User Session Summary"),
         retention_details_sheet=optional_env("RETENTION_DETAILS_SHEET", "GA4 Retention Details"),
+        notification_daily_sheet=optional_env("NOTIFICATION_DAILY_SHEET", "GA4 Daily Notifications"),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
         end_date=optional_env("END_DATE", "yesterday"),
@@ -75,4 +78,8 @@ def load_config() -> Config:
         default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
 
         retention_days=optional_int_env("RETENTION_DAYS", 7),
+        notification_events=optional_env(
+            "NOTIFICATION_EVENTS",
+            "notification_receive,notification_open,notification_foreground,notification_dismiss",
+        ),
     )
