@@ -323,9 +323,39 @@ def get_metric(row_data: dict, possible_names: list[str], default=""):
     return default
 
 
+def classify_api_error(error) -> tuple[str, str]:
+    error_text = str(error)
+    error_lower = error_text.lower()
+
+    no_access_keywords = [
+        "403",
+        "permission denied",
+        "does not have sufficient permissions",
+        "user does not have sufficient permissions",
+        "access denied",
+        "permission",
+    ]
+
+    invalid_property_keywords = [
+        "404",
+        "not found",
+        "property not found",
+        "invalid property",
+    ]
+
+    if any(keyword in error_lower for keyword in no_access_keywords):
+        return "NO ACCESS", error_text
+
+    if any(keyword in error_lower for keyword in invalid_property_keywords):
+        return "INVALID PROPERTY ID", error_text
+
+    return "ERROR", error_text
+
+
 # =========================
 # FUNNEL REPORT
 # =========================
+
 
 def funnel_event_filter(event_name: str) -> FunnelFilterExpression:
     return FunnelFilterExpression(
@@ -492,6 +522,19 @@ def parse_funnel_rows(app: AppConfig, response):
     if first_open_abandonments > 0:
         drop_off = first_open_abandonments
 
+    if first_open_users == 0 and home_users == 0:
+        status = "NO GA4 DATA"
+        error_message = "GA4 property has no matching data in this date range."
+    elif first_open_users > 0 and home_users == 0:
+        status = "CHECK HOME SCREEN"
+        error_message = (
+            "first_open exists but home users are 0. "
+            "Check Home Screen Name in Apps Config."
+        )
+    else:
+        status = "SUCCESS"
+        error_message = ""
+
     summary_row = [
         app.app_name,
         app.property_id,
@@ -503,8 +546,8 @@ def parse_funnel_rows(app: AppConfig, response):
         abandonment_rate,
         app.home_screen_name,
         app.screen_field,
-        "SUCCESS",
-        "",
+        status,
+        error_message,
         updated_at,
     ]
 
@@ -514,6 +557,7 @@ def parse_funnel_rows(app: AppConfig, response):
 # =========================
 # USER + SESSION REPORT
 # =========================
+
 
 def run_user_session_report(app: AppConfig):
     request = RunReportRequest(
@@ -591,6 +635,7 @@ def parse_user_session_report(response) -> dict:
 # =========================
 # RETENTION REPORT
 # =========================
+
 
 def run_retention_report(app: AppConfig):
     cohort_start, cohort_end = get_retention_cohort_date_range()
@@ -770,9 +815,37 @@ def empty_retention_summary() -> dict:
     }
 
 
+def append_error_retention_detail(
+    retention_details_rows: list[list],
+    app: AppConfig,
+    report_date_range: str,
+    retention_summary: dict,
+    status: str,
+    error_text: str,
+):
+    retention_details_rows.append(
+        [
+            app.app_name,
+            app.property_id,
+            report_date_range,
+            retention_summary["cohort_date_range"],
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            status,
+            error_text,
+            now_text(),
+        ]
+    )
+
+
 # =========================
 # MAIN
 # =========================
+
 
 def main():
     print("Reading app list from Apps Config sheet...")
@@ -879,10 +952,10 @@ def main():
             funnel_details_rows.extend(app_funnel_details)
 
         except Exception as error:
-            error_text = str(error)
+            status, error_text = classify_api_error(error)
             updated_at = now_text()
 
-            print(f"FUNNEL ERROR for {app.app_name}: {error_text}")
+            print(f"FUNNEL {status} for {app.app_name}: {error_text}")
 
             funnel_summary_rows.append(
                 [
@@ -896,7 +969,7 @@ def main():
                     "",
                     app.home_screen_name,
                     app.screen_field,
-                    "ERROR",
+                    status,
                     error_text,
                     updated_at,
                 ]
@@ -914,7 +987,7 @@ def main():
                     "",
                     "",
                     "",
-                    "ERROR",
+                    status,
                     error_text,
                     updated_at,
                 ]
@@ -923,17 +996,18 @@ def main():
         # User/session + retention
         session_data = empty_session_data()
         retention_summary = empty_retention_summary()
-
         errors = []
+        status_priority = []
 
         try:
             session_response = run_user_session_report(app)
             session_data = parse_user_session_report(session_response)
 
         except Exception as error:
-            error_text = str(error)
-            errors.append(f"Session error: {error_text}")
-            print(f"SESSION ERROR for {app.app_name}: {error_text}")
+            status, error_text = classify_api_error(error)
+            errors.append(f"Session {status}: {error_text}")
+            status_priority.append(status)
+            print(f"SESSION {status} for {app.app_name}: {error_text}")
 
         try:
             retention_response = run_retention_report(app)
@@ -945,30 +1019,33 @@ def main():
             retention_details_rows.extend(app_retention_details)
 
         except Exception as error:
-            error_text = str(error)
-            errors.append(f"Retention error: {error_text}")
-            print(f"RETENTION ERROR for {app.app_name}: {error_text}")
+            status, error_text = classify_api_error(error)
+            errors.append(f"Retention {status}: {error_text}")
+            status_priority.append(status)
+            print(f"RETENTION {status} for {app.app_name}: {error_text}")
 
-            retention_details_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    retention_summary["cohort_date_range"],
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "ERROR",
-                    error_text,
-                    now_text(),
-                ]
+            append_error_retention_detail(
+                retention_details_rows=retention_details_rows,
+                app=app,
+                report_date_range=report_date_range,
+                retention_summary=retention_summary,
+                status=status,
+                error_text=error_text,
             )
 
-        status = "SUCCESS" if not errors else "ERROR"
-        error_text = " | ".join(errors)
+        if not errors:
+            user_session_status = "SUCCESS"
+            user_session_error = ""
+        elif "NO ACCESS" in status_priority:
+            user_session_status = "NO ACCESS"
+            user_session_error = " | ".join(errors)
+        elif "INVALID PROPERTY ID" in status_priority:
+            user_session_status = "INVALID PROPERTY ID"
+            user_session_error = " | ".join(errors)
+        else:
+            user_session_status = "ERROR"
+            user_session_error = " | ".join(errors)
+
         updated_at = now_text()
 
         user_session_rows.append(
@@ -992,8 +1069,8 @@ def main():
                 retention_summary["d1_retention"],
                 retention_summary["d7_active_users"],
                 retention_summary["d7_retention"],
-                status,
-                error_text,
+                user_session_status,
+                user_session_error,
                 updated_at,
             ]
         )
