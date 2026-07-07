@@ -526,10 +526,10 @@ def parse_funnel_rows(app: AppConfig, response):
         status = "NO GA4 DATA"
         error_message = "GA4 property has no matching data in this date range."
     elif first_open_users > 0 and home_users == 0:
-        status = "CHECK HOME SCREEN"
+        status = "NO FUNNEL MATCH"
         error_message = (
-            "first_open exists but home users are 0. "
-            "Check Home Screen Name in Apps Config."
+            "first_open exists, but no users reached the selected home screen "
+            "inside the closed funnel. Screen name may be correct, but funnel path has no match."
         )
     else:
         status = "SUCCESS"
