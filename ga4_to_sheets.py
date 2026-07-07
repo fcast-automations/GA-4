@@ -28,8 +28,9 @@ from google.analytics.data_v1beta.types import (
     Cohort,
     CohortSpec,
     CohortsRange,
-    Filter,
-    FilterExpression,
+    Filter as BetaFilter,
+    FilterExpression as BetaFilterExpression,
+    FilterExpressionList as BetaFilterExpressionList,
 )
 
 from googleapiclient.discovery import build
@@ -243,34 +244,6 @@ def get_report_date_range_display() -> str:
     end = resolve_ga4_date(config.end_date)
 
     return f"{start} to {end}"
-
-
-def get_report_dates() -> list[str]:
-    start_date = datetime.fromisoformat(
-        resolve_ga4_date(config.start_date)
-    ).date()
-
-    end_date = datetime.fromisoformat(
-        resolve_ga4_date(config.end_date)
-    ).date()
-
-    dates = []
-    current_date = start_date
-
-    while current_date <= end_date:
-        dates.append(current_date.isoformat())
-        current_date += timedelta(days=1)
-
-    return dates
-
-
-def format_ga4_date(value: str) -> str:
-    value = str(value).strip()
-
-    if re.fullmatch(r"\d{8}", value):
-        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
-
-    return value
 
 
 def get_retention_cohort_date_range() -> tuple[str, str]:
@@ -818,161 +791,6 @@ def parse_retention_report(app: AppConfig, response):
     return summary, detail_rows
 
 
-# =========================
-# DAILY NOTIFICATIONS REPORT
-# =========================
-
-
-def get_notification_events() -> list[str]:
-    return [
-        event.strip()
-        for event in config.notification_events.split(",")
-        if event.strip()
-    ]
-
-
-def run_daily_notifications_report(app: AppConfig):
-    notification_events = get_notification_events()
-
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[
-            BetaDateRange(
-                start_date=config.start_date,
-                end_date=config.end_date,
-            )
-        ],
-        dimensions=[
-            Dimension(name="date"),
-            Dimension(name="eventName"),
-        ],
-        metrics=[
-            Metric(name="eventCount"),
-            Metric(name="activeUsers"),
-        ],
-        dimension_filter=FilterExpression(
-            filter=Filter(
-                field_name="eventName",
-                in_list_filter=Filter.InListFilter(
-                    values=notification_events,
-                    case_sensitive=False,
-                ),
-            )
-        ),
-        keep_empty_rows=False,
-    )
-
-    return beta_client.run_report(request)
-
-
-def parse_daily_notifications_report(app: AppConfig, response):
-    notification_events = get_notification_events()
-    report_dates = get_report_dates()
-    updated_at = now_text()
-
-    counts_by_date = {
-        report_date: {
-            event_name: 0 for event_name in notification_events
-        }
-        for report_date in report_dates
-    }
-
-    users_by_date = {
-        report_date: {
-            event_name: 0 for event_name in notification_events
-        }
-        for report_date in report_dates
-    }
-
-    dimension_headers = [
-        header.name for header in response.dimension_headers
-    ]
-
-    metric_headers = [
-        header.name for header in response.metric_headers
-    ]
-
-    for row in response.rows:
-        row_data = {}
-
-        for index, dimension_value in enumerate(row.dimension_values):
-            row_data[dimension_headers[index]] = dimension_value.value
-
-        for index, metric_value in enumerate(row.metric_values):
-            row_data[metric_headers[index]] = metric_value.value
-
-        report_date = format_ga4_date(row_data.get("date", ""))
-        event_name = row_data.get("eventName", "")
-
-        event_count = to_number(row_data.get("eventCount", 0))
-        active_users = to_number(row_data.get("activeUsers", 0))
-
-        if report_date not in counts_by_date:
-            counts_by_date[report_date] = {
-                event: 0 for event in notification_events
-            }
-            users_by_date[report_date] = {
-                event: 0 for event in notification_events
-            }
-
-        counts_by_date[report_date][event_name] = event_count
-        users_by_date[report_date][event_name] = active_users
-
-    rows = []
-
-    for report_date in report_dates:
-        received_count = counts_by_date[report_date].get("notification_receive", 0)
-        opened_count = counts_by_date[report_date].get("notification_open", 0)
-        foreground_count = counts_by_date[report_date].get("notification_foreground", 0)
-        dismissed_count = counts_by_date[report_date].get("notification_dismiss", 0)
-
-        receive_users = users_by_date[report_date].get("notification_receive", 0)
-        open_users = users_by_date[report_date].get("notification_open", 0)
-        foreground_users = users_by_date[report_date].get("notification_foreground", 0)
-        dismiss_users = users_by_date[report_date].get("notification_dismiss", 0)
-
-        total_notification_events = (
-            received_count
-            + opened_count
-            + foreground_count
-            + dismissed_count
-        )
-
-        if total_notification_events > 0:
-            status = "SUCCESS"
-            error_message = ""
-        else:
-            status = "NO NOTIFICATION DATA"
-            error_message = "No notification events found for this app on this date."
-
-        rows.append(
-            [
-                app.app_name,
-                app.property_id,
-                report_date,
-                received_count,
-                opened_count,
-                foreground_count,
-                dismissed_count,
-                make_rate(opened_count, received_count),
-                receive_users,
-                open_users,
-                foreground_users,
-                dismiss_users,
-                status,
-                error_message,
-                updated_at,
-            ]
-        )
-
-    return rows
-
-
-# =========================
-# EMPTY / ERROR HELPERS
-# =========================
-
-
 def empty_session_data() -> dict:
     return {
         "active_users": "",
@@ -1028,19 +846,183 @@ def append_error_retention_detail(
     )
 
 
-def get_final_status(errors: list[str], status_priority: list[str]) -> tuple[str, str]:
-    if not errors:
-        return "SUCCESS", ""
+# =========================
+# AUDIENCE SEGMENTS REPORT
+# =========================
 
-    error_text = " | ".join(errors)
 
-    if "NO ACCESS" in status_priority:
-        return "NO ACCESS", error_text
+def beta_exact_filter(field_name: str, value: str) -> BetaFilterExpression:
+    return BetaFilterExpression(
+        filter=BetaFilter(
+            field_name=field_name,
+            string_filter=BetaFilter.StringFilter(
+                match_type=BetaFilter.StringFilter.MatchType.EXACT,
+                value=value,
+                case_sensitive=False,
+            ),
+        )
+    )
 
-    if "INVALID PROPERTY ID" in status_priority:
-        return "INVALID PROPERTY ID", error_text
 
-    return "ERROR", error_text
+def beta_or_filter(expressions: list[BetaFilterExpression]) -> BetaFilterExpression:
+    return BetaFilterExpression(
+        or_group=BetaFilterExpressionList(
+            expressions=expressions
+        )
+    )
+
+
+def get_audience_segments():
+    paid_channel_groups = [
+        "Paid Search",
+        "Paid Social",
+        "Paid Video",
+        "Paid Shopping",
+        "Cross-network",
+        "Display",
+        "Paid Other",
+    ]
+
+    return [
+        {
+            "name": "All Users",
+            "rule": "No filter",
+            "filter": None,
+        },
+        {
+            "name": "US Users",
+            "rule": "country = United States",
+            "filter": beta_exact_filter("country", "United States"),
+        },
+        {
+            "name": "Direct Traffic",
+            "rule": "sessionDefaultChannelGroup = Direct",
+            "filter": beta_exact_filter("sessionDefaultChannelGroup", "Direct"),
+        },
+        {
+            "name": "Paid Traffic",
+            "rule": "sessionDefaultChannelGroup in paid channel groups",
+            "filter": beta_or_filter(
+                [
+                    beta_exact_filter("sessionDefaultChannelGroup", channel)
+                    for channel in paid_channel_groups
+                ]
+            ),
+        },
+        {
+            "name": "Mobile Traffic",
+            "rule": "deviceCategory = mobile",
+            "filter": beta_exact_filter("deviceCategory", "mobile"),
+        },
+        {
+            "name": "Tablet Traffic",
+            "rule": "deviceCategory = tablet",
+            "filter": beta_exact_filter("deviceCategory", "tablet"),
+        },
+    ]
+
+
+def run_audience_segment_report(app: AppConfig, segment_filter):
+    request_params = {
+        "property": f"properties/{app.property_id}",
+        "date_ranges": [
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        "metrics": [
+            Metric(name="activeUsers"),
+            Metric(name="newUsers"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="userEngagementDuration"),
+            Metric(name="engagementRate"),
+        ],
+    }
+
+    if segment_filter is not None:
+        request_params["dimension_filter"] = segment_filter
+
+    request = RunReportRequest(**request_params)
+
+    return beta_client.run_report(request)
+
+
+def build_audience_segment_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+
+    for segment in get_audience_segments():
+        segment_name = segment["name"]
+        segment_rule = segment["rule"]
+
+        try:
+            response = run_audience_segment_report(
+                app=app,
+                segment_filter=segment["filter"],
+            )
+
+            data = parse_user_session_report(response)
+
+            if data["active_users"] == 0:
+                status = "NO SEGMENT DATA"
+                error_text = "No users found for this segment in selected date range."
+            else:
+                status = "SUCCESS"
+                error_text = ""
+
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    segment_name,
+                    segment_rule,
+                    data["active_users"],
+                    data["new_users"],
+                    data["sessions"],
+                    data["engaged_sessions"],
+                    data["average_session_duration_seconds"],
+                    data["average_session_duration"],
+                    data["total_engagement_seconds"],
+                    data["total_engagement_time"],
+                    data["sessions_per_active_user"],
+                    data["engagement_rate"],
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    segment_name,
+                    segment_rule,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+    return rows
 
 
 # =========================
@@ -1136,20 +1118,23 @@ def main():
         ]
     ]
 
-    notification_daily_rows = [
+    audience_segment_rows = [
         [
             "App Name",
             "Property ID",
-            "Date",
-            "Notification Received",
-            "Notification Opened",
-            "Notification Foreground",
-            "Notification Dismissed",
-            "Notification Open Rate",
-            "Receive Active Users",
-            "Open Active Users",
-            "Foreground Active Users",
-            "Dismiss Active Users",
+            "Report Date Range",
+            "Audience Segment",
+            "Segment Rule",
+            "Active Users",
+            "New Users",
+            "Sessions",
+            "Engaged Sessions",
+            "Avg Session Duration Seconds",
+            "Avg Session Duration",
+            "Total Engagement Seconds",
+            "Total Engagement Time",
+            "Sessions Per Active User",
+            "Engagement Rate",
             "Status",
             "Error",
             "Updated At",
@@ -1254,10 +1239,18 @@ def main():
                 error_text=error_text,
             )
 
-        user_session_status, user_session_error = get_final_status(
-            errors,
-            status_priority,
-        )
+        if not errors:
+            user_session_status = "SUCCESS"
+            user_session_error = ""
+        elif "NO ACCESS" in status_priority:
+            user_session_status = "NO ACCESS"
+            user_session_error = " | ".join(errors)
+        elif "INVALID PROPERTY ID" in status_priority:
+            user_session_status = "INVALID PROPERTY ID"
+            user_session_error = " | ".join(errors)
+        else:
+            user_session_status = "ERROR"
+            user_session_error = " | ".join(errors)
 
         updated_at = now_text()
 
@@ -1288,26 +1281,21 @@ def main():
             ]
         )
 
-        # Daily notifications
+        # Audience segments
         try:
-            notification_response = run_daily_notifications_report(app)
-            app_notification_rows = parse_daily_notifications_report(
-                app,
-                notification_response,
-            )
-
-            notification_daily_rows.extend(app_notification_rows)
+            app_audience_rows = build_audience_segment_rows_for_app(app)
+            audience_segment_rows.extend(app_audience_rows)
 
         except Exception as error:
             status, error_text = classify_api_error(error)
-            updated_at = now_text()
 
-            print(f"NOTIFICATION {status} for {app.app_name}: {error_text}")
-
-            notification_daily_rows.append(
+            audience_segment_rows.append(
                 [
                     app.app_name,
                     app.property_id,
+                    report_date_range,
+                    "",
+                    "",
                     "",
                     "",
                     "",
@@ -1320,7 +1308,7 @@ def main():
                     "",
                     status,
                     error_text,
-                    updated_at,
+                    now_text(),
                 ]
             )
 
@@ -1328,14 +1316,14 @@ def main():
     write_sheet(config.details_sheet, funnel_details_rows)
     write_sheet(config.user_session_sheet, user_session_rows)
     write_sheet(config.retention_details_sheet, retention_details_rows)
-    write_sheet(config.notification_daily_sheet, notification_daily_rows)
+    write_sheet(config.audience_segments_sheet, audience_segment_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
     print(f"Funnel Details: {config.details_sheet}")
     print(f"User Session Summary: {config.user_session_sheet}")
     print(f"Retention Details: {config.retention_details_sheet}")
-    print(f"Daily Notifications: {config.notification_daily_sheet}")
+    print(f"Audience Segments: {config.audience_segments_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
