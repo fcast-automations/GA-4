@@ -28,6 +28,7 @@ from google.analytics.data_v1beta.types import (
     Cohort,
     CohortSpec,
     CohortsRange,
+    OrderBy,
     Filter as BetaFilter,
     FilterExpression as BetaFilterExpression,
     FilterExpressionList as BetaFilterExpressionList,
@@ -1025,57 +1026,45 @@ def build_audience_segment_rows_for_app(app: AppConfig) -> list[list]:
     return rows
 
 
-
 # =========================
 # PERSONALIZED USER EXPERIENCE REPORT
 # =========================
 
 
-def get_personalized_ux_dimensions():
-    return [
-        {
-            "area": "Country Experience",
-            "dimension": "country",
-            "label": "Country",
-        },
-        {
-            "area": "Language Experience",
-            "dimension": "language",
-            "label": "Language",
-        },
-        {
-            "area": "Device Experience",
-            "dimension": "deviceCategory",
-            "label": "Device Category",
-        },
-        {
-            "area": "Operating System Experience",
-            "dimension": "operatingSystem",
-            "label": "Operating System",
-        },
-        {
-            "area": "App Version Experience",
-            "dimension": "appVersion",
-            "label": "App Version",
-        },
-        {
-            "area": "Acquisition Experience",
-            "dimension": "firstUserMedium",
-            "label": "First User Medium",
-        },
-        {
-            "area": "Screen Experience",
-            "dimension": "unifiedPagePathScreen",
-            "label": "Page Path / Screen Class",
-        },
-    ]
+def parse_session_metric_values(metric_headers: list[str], metric_values) -> dict:
+    row_data = {}
+
+    for index, metric_value in enumerate(metric_values):
+        row_data[metric_headers[index]] = metric_value.value
+
+    active_users = to_number(row_data.get("activeUsers", 0))
+    new_users = to_number(row_data.get("newUsers", 0))
+    sessions = to_number(row_data.get("sessions", 0))
+    engaged_sessions = to_number(row_data.get("engagedSessions", 0))
+
+    avg_session_seconds = to_float(row_data.get("averageSessionDuration", 0))
+    total_engagement_seconds = to_float(row_data.get("userEngagementDuration", 0))
+
+    if active_users > 0:
+        sessions_per_active_user = round(sessions / active_users, 2)
+    else:
+        sessions_per_active_user = 0
+
+    return {
+        "active_users": active_users,
+        "new_users": new_users,
+        "sessions": sessions,
+        "engaged_sessions": engaged_sessions,
+        "average_session_duration_seconds": round(avg_session_seconds, 2),
+        "average_session_duration": format_seconds(avg_session_seconds),
+        "total_engagement_seconds": round(total_engagement_seconds, 2),
+        "total_engagement_time": format_seconds(total_engagement_seconds),
+        "sessions_per_active_user": sessions_per_active_user,
+        "engagement_rate": to_percent(row_data.get("engagementRate", 0)),
+    }
 
 
-def run_personalized_ux_report(
-    app: AppConfig,
-    dimension_name: str,
-    limit: int,
-):
+def run_dimension_session_report(app: AppConfig, dimension_name: str, limit: int):
     request = RunReportRequest(
         property=f"properties/{app.property_id}",
         date_ranges=[
@@ -1096,265 +1085,205 @@ def run_personalized_ux_report(
             Metric(name="userEngagementDuration"),
             Metric(name="engagementRate"),
         ],
+        order_bys=[
+            OrderBy(
+                metric=OrderBy.MetricOrderBy(metric_name="activeUsers"),
+                desc=True,
+            )
+        ],
         limit=limit,
     )
 
     return beta_client.run_report(request)
 
 
-def safe_int(value) -> int:
-    try:
-        if value in [None, ""]:
-            return 0
+def get_personalized_ux_dimensions() -> list[dict]:
+    return [
+        {
+            "breakdown": "Country",
+            "dimension": "country",
+            "recommendation_type": "country",
+        },
+        {
+            "breakdown": "Language",
+            "dimension": "language",
+            "recommendation_type": "language",
+        },
+        {
+            "breakdown": "Device Category",
+            "dimension": "deviceCategory",
+            "recommendation_type": "device",
+        },
+        {
+            "breakdown": "Operating System",
+            "dimension": "operatingSystem",
+            "recommendation_type": "os",
+        },
+        {
+            "breakdown": "App Version",
+            "dimension": "appVersion",
+            "recommendation_type": "app_version",
+        },
+        {
+            "breakdown": "First User Medium",
+            "dimension": "firstUserMedium",
+            "recommendation_type": "traffic",
+        },
+        {
+            "breakdown": "Top Screens / Screen Class",
+            "dimension": "unifiedPagePathScreen",
+            "recommendation_type": "screen",
+        },
+    ]
 
-        return int(float(value))
-    except Exception:
-        return 0
 
-
-def safe_rate_text(numerator, denominator) -> str:
-    numerator_value = safe_int(numerator)
-    denominator_value = safe_int(denominator)
-
-    if denominator_value == 0:
-        return "0%"
-
-    return f"{round((numerator_value / denominator_value) * 100, 2)}%"
-
-
-def get_personalized_ux_recommendation(
-    area: str,
+def build_personalized_recommendation(
+    recommendation_type: str,
     dimension_value: str,
-    active_users: int,
-    engagement_rate_raw,
-    avg_session_seconds,
-    user_share_text: str,
+    data: dict,
 ) -> str:
+    active_users = data.get("active_users", 0)
+    engagement_rate = data.get("engagement_rate", "")
+    avg_session = data.get("average_session_duration", "")
+
     if active_users == 0:
-        return "No personalization action needed because this segment has no users."
+        return "No meaningful traffic for this segment in the selected date range."
 
-    engagement_rate_value = to_float(engagement_rate_raw)
-    avg_seconds_value = to_float(avg_session_seconds)
+    value = dimension_value or "(not set)"
 
-    if engagement_rate_value <= 1:
-        engagement_rate_percent = engagement_rate_value * 100
-    else:
-        engagement_rate_percent = engagement_rate_value
-
-    if active_users >= 100 and engagement_rate_percent < 40:
+    if recommendation_type == "country":
         return (
-            f"High priority: users in {dimension_value} have low engagement. "
-            "Review onboarding, content relevance, loading speed, and screen flow for this segment."
+            f"Personalize store creatives, language, and offers for {value}. "
+            f"Review retention and engagement for this country."
         )
 
-    if area == "Country Experience":
+    if recommendation_type == "language":
         return (
-            f"Personalize store listing, language tone, pricing, and onboarding for {dimension_value}. "
-            f"This segment represents {user_share_text} of active users."
+            f"Localize onboarding, paywall, and core UI copy for language {value}. "
+            "Prioritize this language if users and engagement are strong."
         )
 
-    if area == "Language Experience":
+    if recommendation_type == "device":
         return (
-            f"Consider localized UI text, onboarding, and support content for {dimension_value} users."
+            f"Optimize layout and performance for {value} users. "
+            "Check screenshots, button sizes, loading time, and ad placement."
         )
 
-    if area == "Device Experience":
+    if recommendation_type == "os":
         return (
-            f"Optimize layout, performance, and touch targets for {dimension_value} users."
+            f"Review OS-specific crashes, permissions, and UX issues for {value}. "
+            "Compare session duration and engagement against other OS values."
         )
 
-    if area == "Operating System Experience":
+    if recommendation_type == "app_version":
         return (
-            f"QA crashes, permissions, speed, and UI compatibility for {dimension_value} users."
+            f"Monitor app version {value}. If engagement or retention is low, "
+            "review release changes, bugs, onboarding, and remote config rules."
         )
 
-    if area == "App Version Experience":
+    if recommendation_type == "traffic":
         return (
-            f"Compare this app version with other versions. If engagement is lower, check release changes and bugs for {dimension_value}."
+            f"Traffic medium {value} should be compared with paid/organic quality. "
+            "Optimize campaigns if sessions per user or engagement rate is weak."
         )
 
-    if area == "Acquisition Experience":
+    if recommendation_type == "screen":
         return (
-            f"Customize onboarding and first-session messaging for users coming from {dimension_value}."
-        )
-
-    if area == "Screen Experience":
-        if avg_seconds_value > 600:
-            return (
-                f"Users spend a long time on {dimension_value}. Check whether this is positive engagement or a confusing flow."
-            )
-
-        return (
-            f"Prioritize UX review for this high-traffic screen: {dimension_value}."
+            f"Screen {value} is important for user experience. "
+            f"Check UX, loading, exits, and feature usage. Avg session: {avg_session}, engagement: {engagement_rate}."
         )
 
     return "Review this segment for personalization opportunities."
 
 
-def parse_personalized_ux_response(
-    app: AppConfig,
-    response,
-    area: str,
-    dimension_name: str,
-    dimension_label: str,
-    total_active_users: int,
-):
+def build_personalized_ux_rows_for_app(app: AppConfig) -> list[list]:
     rows = []
     report_date_range = get_report_date_range_display()
+    top_n = getattr(config, "personalized_top_n", 10)
 
-    if not response.rows:
-        return [
-            [
-                app.app_name,
-                app.property_id,
-                report_date_range,
-                area,
-                dimension_label,
-                dimension_name,
-                "",
-                0,
-                "0%",
-                0,
-                0,
-                0,
-                0,
-                0,
-                "0m 0s",
-                0,
-                "0m 0s",
-                0,
-                "0%",
-                "No users found for this personalization dimension.",
-                "NO UX DATA",
-                "",
-                now_text(),
-            ]
-        ]
-
-    dimension_headers = [header.name for header in response.dimension_headers]
-    metric_headers = [header.name for header in response.metric_headers]
-
-    parsed_rows = []
-
-    for row in response.rows:
-        row_data = {}
-
-        for index, dimension_value in enumerate(row.dimension_values):
-            row_data[dimension_headers[index]] = dimension_value.value
-
-        for index, metric_value in enumerate(row.metric_values):
-            row_data[metric_headers[index]] = metric_value.value
-
-        dimension_value = row_data.get(dimension_name, "")
-
-        if not str(dimension_value).strip():
-            dimension_value = "(not set)"
-
-        active_users = safe_int(row_data.get("activeUsers", 0))
-        parsed_rows.append((active_users, dimension_value, row_data))
-
-    parsed_rows.sort(key=lambda item: item[0], reverse=True)
-
-    for rank, (active_users, dimension_value, row_data) in enumerate(parsed_rows, start=1):
-        new_users = safe_int(row_data.get("newUsers", 0))
-        sessions = safe_int(row_data.get("sessions", 0))
-        engaged_sessions = safe_int(row_data.get("engagedSessions", 0))
-
-        avg_session_seconds = to_float(row_data.get("averageSessionDuration", 0))
-        total_engagement_seconds = to_float(row_data.get("userEngagementDuration", 0))
-
-        if active_users > 0:
-            sessions_per_active_user = round(sessions / active_users, 2)
-        else:
-            sessions_per_active_user = 0
-
-        user_share = safe_rate_text(active_users, total_active_users)
-        engagement_rate_raw = row_data.get("engagementRate", 0)
-
-        recommendation = get_personalized_ux_recommendation(
-            area=area,
-            dimension_value=dimension_value,
-            active_users=active_users,
-            engagement_rate_raw=engagement_rate_raw,
-            avg_session_seconds=avg_session_seconds,
-            user_share_text=user_share,
-        )
-
-        rows.append(
-            [
-                app.app_name,
-                app.property_id,
-                report_date_range,
-                area,
-                dimension_label,
-                dimension_name,
-                dimension_value,
-                rank,
-                user_share,
-                active_users,
-                new_users,
-                sessions,
-                engaged_sessions,
-                round(avg_session_seconds, 2),
-                format_seconds(avg_session_seconds),
-                round(total_engagement_seconds, 2),
-                format_seconds(total_engagement_seconds),
-                sessions_per_active_user,
-                to_percent(engagement_rate_raw),
-                recommendation,
-                "SUCCESS",
-                "",
-                now_text(),
-            ]
-        )
-
-    return rows
-
-
-def build_personalized_ux_rows_for_app(
-    app: AppConfig,
-    total_active_users,
-) -> list[list]:
-    rows = []
-    total_active_users_value = safe_int(total_active_users)
-    report_limit = max(config.ux_report_limit, 1)
-
-    for dimension_config in get_personalized_ux_dimensions():
-        area = dimension_config["area"]
-        dimension_name = dimension_config["dimension"]
-        dimension_label = dimension_config["label"]
+    for item in get_personalized_ux_dimensions():
+        breakdown = item["breakdown"]
+        dimension_name = item["dimension"]
+        recommendation_type = item["recommendation_type"]
 
         try:
-            response = run_personalized_ux_report(
+            response = run_dimension_session_report(
                 app=app,
                 dimension_name=dimension_name,
-                limit=report_limit,
+                limit=top_n,
             )
 
-            rows.extend(
-                parse_personalized_ux_response(
-                    app=app,
-                    response=response,
-                    area=area,
-                    dimension_name=dimension_name,
-                    dimension_label=dimension_label,
-                    total_active_users=total_active_users_value,
+            if not response.rows:
+                rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        breakdown,
+                        dimension_name,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "NO UX DATA",
+                        "No rows returned for this personalization breakdown.",
+                        now_text(),
+                    ]
                 )
-            )
+                continue
+
+            metric_headers = [header.name for header in response.metric_headers]
+
+            for row in response.rows:
+                dimension_value = row.dimension_values[0].value if row.dimension_values else ""
+                data = parse_session_metric_values(metric_headers, row.metric_values)
+                recommendation = build_personalized_recommendation(
+                    recommendation_type=recommendation_type,
+                    dimension_value=dimension_value,
+                    data=data,
+                )
+
+                rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        breakdown,
+                        dimension_name,
+                        dimension_value,
+                        data["active_users"],
+                        data["new_users"],
+                        data["sessions"],
+                        data["engaged_sessions"],
+                        data["average_session_duration_seconds"],
+                        data["average_session_duration"],
+                        data["total_engagement_seconds"],
+                        data["total_engagement_time"],
+                        data["sessions_per_active_user"],
+                        data["engagement_rate"],
+                        recommendation,
+                        "SUCCESS",
+                        "",
+                        now_text(),
+                    ]
+                )
 
         except Exception as error:
             status, error_text = classify_api_error(error)
-
             rows.append(
                 [
                     app.app_name,
                     app.property_id,
-                    get_report_date_range_display(),
-                    area,
-                    dimension_label,
+                    report_date_range,
+                    breakdown,
                     dimension_name,
-                    "",
-                    "",
                     "",
                     "",
                     "",
@@ -1374,6 +1303,301 @@ def build_personalized_ux_rows_for_app(
             )
 
     return rows
+
+
+# =========================
+# REMOTE CONFIGURATION REPORT
+# =========================
+
+
+def beta_contains_filter(field_name: str, value: str) -> BetaFilterExpression:
+    return BetaFilterExpression(
+        filter=BetaFilter(
+            field_name=field_name,
+            string_filter=BetaFilter.StringFilter(
+                match_type=BetaFilter.StringFilter.MatchType.CONTAINS,
+                value=value,
+                case_sensitive=False,
+            ),
+        )
+    )
+
+
+def get_remote_config_event_filter() -> BetaFilterExpression:
+    remote_config_keywords = [
+        "remote_config",
+        "remote config",
+        "config",
+        "experiment",
+        "variant",
+        "feature_flag",
+        "featureflag",
+        "ab_test",
+        "abtest",
+        "firebase_exp",
+        "rc_",
+    ]
+
+    return beta_or_filter(
+        [
+            beta_contains_filter("eventName", keyword)
+            for keyword in remote_config_keywords
+        ]
+    )
+
+
+def run_remote_config_events_report(app: AppConfig):
+    limit = getattr(config, "remote_config_event_limit", 25)
+
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        dimensions=[
+            Dimension(name="eventName"),
+        ],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="eventCount"),
+        ],
+        dimension_filter=get_remote_config_event_filter(),
+        order_bys=[
+            OrderBy(
+                metric=OrderBy.MetricOrderBy(metric_name="eventCount"),
+                desc=True,
+            )
+        ],
+        limit=limit,
+    )
+
+    return beta_client.run_report(request)
+
+
+def run_remote_config_app_version_report(app: AppConfig):
+    limit = getattr(config, "remote_config_app_version_limit", 10)
+
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[
+            BetaDateRange(
+                start_date=config.start_date,
+                end_date=config.end_date,
+            )
+        ],
+        dimensions=[
+            Dimension(name="appVersion"),
+        ],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="newUsers"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="userEngagementDuration"),
+            Metric(name="engagementRate"),
+        ],
+        order_bys=[
+            OrderBy(
+                metric=OrderBy.MetricOrderBy(metric_name="activeUsers"),
+                desc=True,
+            )
+        ],
+        limit=limit,
+    )
+
+    return beta_client.run_report(request)
+
+
+def get_remote_event_type(event_name: str) -> str:
+    event_lower = str(event_name).lower()
+
+    if "experiment" in event_lower or "firebase_exp" in event_lower or "ab" in event_lower:
+        return "Experiment / A-B Test"
+
+    if "variant" in event_lower:
+        return "Variant"
+
+    if "feature" in event_lower or "flag" in event_lower:
+        return "Feature Flag"
+
+    if "config" in event_lower or event_lower.startswith("rc_"):
+        return "Remote Config"
+
+    return "Config Related Event"
+
+
+def build_remote_config_recommendation(row_type: str, value: str, data: dict | None = None) -> str:
+    if row_type == "Remote Config Event":
+        return (
+            f"Event {value} is being logged. Compare users and event count with app versions, "
+            "retention, and funnel conversion to understand config impact."
+        )
+
+    if row_type == "App Version Impact":
+        engagement = data.get("engagement_rate", "") if data else ""
+        avg_session = data.get("average_session_duration", "") if data else ""
+        return (
+            f"Use app version {value} as a Remote Config impact check. "
+            f"Compare engagement {engagement} and avg session {avg_session} against other versions."
+        )
+
+    return "Review this row for Remote Config impact."
+
+
+def build_remote_config_rows_for_app(app: AppConfig) -> list[list]:
+    rows = []
+    report_date_range = get_report_date_range_display()
+
+    # 1) Remote Config / experiment / variant event signals.
+    try:
+        response = run_remote_config_events_report(app)
+        metric_headers = [header.name for header in response.metric_headers]
+
+        if not response.rows:
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "Remote Config Event",
+                    "eventName contains remote/config/experiment/variant/feature flag keywords",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "NO REMOTE CONFIG EVENTS",
+                    "No remote config / experiment / variant events found in GA4 for this date range. Log custom events or register custom dimensions if you need deeper tracking.",
+                    now_text(),
+                ]
+            )
+        else:
+            for row in response.rows:
+                event_name = row.dimension_values[0].value if row.dimension_values else ""
+                row_data = {}
+
+                for index, metric_value in enumerate(row.metric_values):
+                    row_data[metric_headers[index]] = metric_value.value
+
+                active_users = to_number(row_data.get("activeUsers", 0))
+                event_count = to_number(row_data.get("eventCount", 0))
+
+                rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "Remote Config Event",
+                        get_remote_event_type(event_name),
+                        event_name,
+                        active_users,
+                        "",
+                        "",
+                        "",
+                        event_count,
+                        "SUCCESS",
+                        build_remote_config_recommendation("Remote Config Event", event_name),
+                        now_text(),
+                    ]
+                )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                "Remote Config Event",
+                "eventName contains remote/config/experiment/variant/feature flag keywords",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                status,
+                error_text,
+                now_text(),
+            ]
+        )
+
+    # 2) App version impact rows. Useful when configs are rolled out by app version.
+    try:
+        response = run_remote_config_app_version_report(app)
+        metric_headers = [header.name for header in response.metric_headers]
+
+        if not response.rows:
+            rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "App Version Impact",
+                    "appVersion breakdown",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "NO VERSION DATA",
+                    "No app version rows found for selected date range.",
+                    now_text(),
+                ]
+            )
+        else:
+            for row in response.rows:
+                app_version = row.dimension_values[0].value if row.dimension_values else ""
+                data = parse_session_metric_values(metric_headers, row.metric_values)
+
+                rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "App Version Impact",
+                        "appVersion breakdown",
+                        app_version,
+                        data["active_users"],
+                        data["new_users"],
+                        data["sessions"],
+                        data["average_session_duration"],
+                        "",
+                        "SUCCESS",
+                        build_remote_config_recommendation("App Version Impact", app_version, data),
+                        now_text(),
+                    ]
+                )
+
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        rows.append(
+            [
+                app.app_name,
+                app.property_id,
+                report_date_range,
+                "App Version Impact",
+                "appVersion breakdown",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                status,
+                error_text,
+                now_text(),
+            ]
+        )
+
+    return rows
+
 
 # =========================
 # MAIN
@@ -1496,12 +1720,9 @@ def main():
             "App Name",
             "Property ID",
             "Report Date Range",
-            "Personalization Area",
-            "Dimension Label",
-            "Dimension Field",
+            "Personalization Breakdown",
+            "GA4 Dimension",
             "Dimension Value",
-            "Rank",
-            "Active User Share",
             "Active Users",
             "New Users",
             "Sessions",
@@ -1515,6 +1736,25 @@ def main():
             "Recommendation",
             "Status",
             "Error",
+            "Updated At",
+        ]
+    ]
+
+    remote_config_rows = [
+        [
+            "App Name",
+            "Property ID",
+            "Report Date Range",
+            "Remote Config Area",
+            "Rule / Type",
+            "Value",
+            "Active Users",
+            "New Users",
+            "Sessions",
+            "Avg Session Duration",
+            "Event Count",
+            "Status",
+            "Recommendation / Error",
             "Updated At",
         ]
     ]
@@ -1692,11 +1932,8 @@ def main():
 
         # Personalized user experience
         try:
-            app_personalized_ux_rows = build_personalized_ux_rows_for_app(
-                app=app,
-                total_active_users=session_data["active_users"],
-            )
-            personalized_ux_rows.extend(app_personalized_ux_rows)
+            app_personalized_rows = build_personalized_ux_rows_for_app(app)
+            personalized_ux_rows.extend(app_personalized_rows)
 
         except Exception as error:
             status, error_text = classify_api_error(error)
@@ -1720,6 +1957,30 @@ def main():
                     "",
                     "",
                     "",
+                    status,
+                    error_text,
+                    now_text(),
+                ]
+            )
+
+        # Remote configuration
+        try:
+            app_remote_config_rows = build_remote_config_rows_for_app(app)
+            remote_config_rows.extend(app_remote_config_rows)
+
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+
+            remote_config_rows.append(
+                [
+                    app.app_name,
+                    app.property_id,
+                    report_date_range,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
                     "",
                     "",
                     "",
@@ -1735,6 +1996,7 @@ def main():
     write_sheet(config.retention_details_sheet, retention_details_rows)
     write_sheet(config.audience_segments_sheet, audience_segment_rows)
     write_sheet(config.personalized_ux_sheet, personalized_ux_rows)
+    write_sheet(config.remote_config_sheet, remote_config_rows)
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -1742,7 +2004,8 @@ def main():
     print(f"User Session Summary: {config.user_session_sheet}")
     print(f"Retention Details: {config.retention_details_sheet}")
     print(f"Audience Segments: {config.audience_segments_sheet}")
-    print(f"Personalized UX: {config.personalized_ux_sheet}")
+    print(f"Personalized User Experience: {config.personalized_ux_sheet}")
+    print(f"Remote Configuration: {config.remote_config_sheet}")
     print(f"Report Date Range: {report_date_range}")
 
 
