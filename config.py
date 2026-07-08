@@ -5,6 +5,7 @@ from dataclasses import dataclass
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/firebase.remoteconfig",
 ]
 
 
@@ -48,6 +49,7 @@ class Config:
     audience_segments_sheet: str
     personalized_ux_sheet: str
     remote_config_sheet: str
+    time_capping_ab_sheet: str
 
     start_date: str
     end_date: str
@@ -60,6 +62,11 @@ class Config:
     personalized_top_n: int
     remote_config_event_limit: int
     remote_config_app_version_limit: int
+
+    time_capping_parameter: str
+    remote_config_namespace: str
+    firebase_remote_config_api_base: str
+    firebase_remote_config_timeout: int
 
 
 def load_config() -> Config:
@@ -90,6 +97,10 @@ def load_config() -> Config:
             "REMOTE_CONFIG_SHEET",
             "GA4 Remote Configuration",
         ),
+        time_capping_ab_sheet=optional_env(
+            "TIME_CAPPING_AB_SHEET",
+            "Firebase AB Time Capping",
+        ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
         end_date=optional_env("END_DATE", "yesterday"),
@@ -110,5 +121,22 @@ def load_config() -> Config:
         remote_config_app_version_limit=optional_int_env(
             "REMOTE_CONFIG_APP_VERSION_LIMIT",
             10,
+        ),
+
+        time_capping_parameter=optional_env(
+            "TIME_CAPPING_PARAMETER",
+            "ad_time_capping",
+        ),
+        remote_config_namespace=optional_env(
+            "REMOTE_CONFIG_NAMESPACE",
+            "firebase",
+        ),
+        firebase_remote_config_api_base=optional_env(
+            "FIREBASE_REMOTE_CONFIG_API_BASE",
+            "https://firebaseremoteconfig.googleapis.com/v1",
+        ),
+        firebase_remote_config_timeout=optional_int_env(
+            "FIREBASE_REMOTE_CONFIG_TIMEOUT",
+            30,
         ),
     )
