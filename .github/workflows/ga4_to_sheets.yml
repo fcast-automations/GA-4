@@ -40,6 +40,9 @@ jobs:
           PERSONALIZED_UX_SHEET: GA4 Personalized User Experience
           REMOTE_CONFIG_SHEET: GA4 Remote Configuration
           TIME_CAPPING_AB_SHEET: Firebase AB Time Capping
+          DAILY_NOTIFICATIONS_SHEET: Firebase Daily Notifications
+          GA4_NOTIFICATION_EVENTS_SHEET: GA4 Notification Events
+          FCM_DELIVERY_SHEET: Firebase Notification Delivery
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
           REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
@@ -47,6 +50,11 @@ jobs:
           TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
           FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
+          DAILY_NOTIFICATION_PARAMETERS: ${{ vars.DAILY_NOTIFICATION_PARAMETERS || '' }}
+          NOTIFICATION_PARAMETER_KEYWORDS: ${{ vars.NOTIFICATION_PARAMETER_KEYWORDS || 'notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm' }}
+          NOTIFICATION_EVENT_NAMES: ${{ vars.NOTIFICATION_EVENT_NAMES || 'notification_receive,notification_foreground,notification_open,notification_dismiss' }}
+          NOTIFICATION_EVENT_LIMIT: ${{ vars.NOTIFICATION_EVENT_LIMIT || '500' }}
+          FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
           DEFAULT_SCREEN_FIELD: unifiedPagePathScreen
