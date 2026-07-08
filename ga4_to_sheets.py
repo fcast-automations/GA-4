@@ -2499,6 +2499,189 @@ def make_daily_notification_empty_row(
     ]
 
 
+
+
+def parsed_json_or_none(value: str):
+    try:
+        return json.loads(str(value or "").strip())
+    except Exception:
+        return None
+
+
+def flatten_json_keys(data, prefix: str = "") -> list[str]:
+    keys = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key_text = f"{prefix}.{key}" if prefix else str(key)
+            keys.append(key_text)
+            keys.extend(flatten_json_keys(value, key_text))
+    elif isinstance(data, list):
+        for item in data:
+            keys.extend(flatten_json_keys(item, prefix))
+    return keys
+
+
+def value_has_notification_content_signal(parameter_key: str, raw_value: str) -> bool:
+    key_lower = str(parameter_key or "").lower()
+    raw_lower = str(raw_value or "").lower()
+    notification_words = [
+        "notification", "notifications", "notif", "notify", "push", "reminder", "fcm",
+    ]
+    message_words = [
+        "title", "heading", "headline", "subject", "body", "content", "text", "message", "description", "desc",
+    ]
+    time_words = [
+        "time", "hour", "schedule", "daily", "repeat", "day", "weekday", "send_at", "trigger",
+    ]
+
+    if any(word in key_lower for word in notification_words):
+        return True
+
+    # If developers used separated keys such as title_1/body_1/time_1, allow content scan to pick them.
+    if get_field_type_from_parameter_key(parameter_key) in ["title", "body", "time", "days"]:
+        return True
+
+    parsed = parsed_json_or_none(raw_value)
+    if isinstance(parsed, (dict, list)):
+        keys_text = " ".join(flatten_json_keys(parsed)).lower()
+        has_notification_word = any(word in keys_text for word in notification_words)
+        has_message_word = any(word in keys_text for word in message_words)
+        has_time_word = any(word in keys_text for word in time_words)
+        if has_notification_word or (has_message_word and has_time_word):
+            return True
+
+    if any(word in raw_lower for word in ["notification", "push", "reminder"]):
+        return True
+
+    return False
+
+
+def append_daily_notification_rows_from_parameter(
+    rows: list[list],
+    base: list,
+    parameter_key: str,
+    parameter: dict,
+    group_name: str,
+    condition_lookup: dict,
+    condition_priority: dict,
+    version_number: str,
+    update_time: str,
+    update_user: str,
+    updated_at: str,
+    source_label: str = "Remote Config",
+    status_label: str = "SUCCESS",
+    recommendation_prefix: str = "",
+) -> tuple[int, dict]:
+    value_type = parameter.get("valueType", "STRING")
+    grouped = {}
+    direct_count = 0
+
+    for value_row in get_parameter_value_rows(parameter, condition_lookup, condition_priority):
+        for plain_value in value_object_to_plain_values(value_row["value_object"]):
+            raw_value = plain_value["value"]
+            experiment_id = plain_value["experiment_id"]
+            variant_id = plain_value["variant_id"]
+            variant_suffix = f" / Variant {variant_id}" if variant_id else ""
+            value_source = value_row["value_source"] + variant_suffix
+            items = extract_notification_items_from_value(raw_value, parameter_key)
+
+            if not items:
+                continue
+
+            for item_index, item in enumerate(items, start=1):
+                field_type = item.get("field_type", "")
+                if field_type == "time":
+                    simple_field_value = item.get("send_time", "")
+                elif field_type in ["title", "body", "days"]:
+                    simple_field_value = item.get(field_type, "")
+                else:
+                    simple_field_value = ""
+
+                if field_type and simple_field_value and len(items) == 1:
+                    group_key = (
+                        value_row["condition_name"],
+                        experiment_id,
+                        variant_id,
+                        get_group_key_from_parameter_key(parameter_key, field_type),
+                    )
+                    grouped.setdefault(
+                        group_key,
+                        {
+                            "parameter_keys": set(),
+                            "group_name": group_name,
+                            "value_source": value_source,
+                            "condition_name": value_row["condition_name"],
+                            "condition_priority": value_row["condition_priority"],
+                            "condition_expression": value_row["condition_expression"],
+                            "value_type": value_type,
+                            "experiment_id": experiment_id,
+                            "variant_id": variant_id,
+                            "title": "",
+                            "body": "",
+                            "send_time": "",
+                            "days": "",
+                            "schedule_type": "Daily / Firebase configured",
+                            "timezone": "",
+                            "raw_values": [],
+                        },
+                    )
+                    grouped[group_key]["parameter_keys"].add(parameter_key)
+                    grouped[group_key]["raw_values"].append(f"{parameter_key}: {raw_value}")
+
+                    if field_type == "title":
+                        grouped[group_key]["title"] = simple_field_value
+                    elif field_type == "body":
+                        grouped[group_key]["body"] = simple_field_value
+                    elif field_type == "time":
+                        grouped[group_key]["send_time"] = simple_field_value
+                    elif field_type == "days":
+                        grouped[group_key]["days"] = simple_field_value
+                    continue
+
+                notification_no = item.get("notification_id") or item_index
+                title = item.get("title", "")
+                body = item.get("body", "")
+                send_time = item.get("send_time", "")
+                schedule_type = item.get("schedule_type", "") or "Daily / Firebase configured"
+                days = item.get("days", "")
+                timezone = item.get("timezone", "")
+                raw_item = item.get("raw_value", raw_value)
+                recommendation = build_daily_notification_recommendation(title, body, send_time, raw_item)
+                if recommendation_prefix:
+                    recommendation = recommendation_prefix + " " + recommendation
+
+                rows.append(
+                    base
+                    + [
+                        source_label,
+                        parameter_key,
+                        group_name,
+                        notification_no,
+                        title,
+                        body,
+                        send_time,
+                        schedule_type,
+                        days,
+                        timezone,
+                        value_source,
+                        value_type,
+                        value_row["condition_name"],
+                        value_row["condition_priority"],
+                        value_row["condition_expression"],
+                        experiment_id,
+                        variant_id,
+                        version_number,
+                        update_time,
+                        update_user,
+                        status_label,
+                        recommendation,
+                        updated_at,
+                    ]
+                )
+                direct_count += 1
+
+    return direct_count, grouped
+
 def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
     rows = []
     report_date_range = get_report_date_range_display()
@@ -2534,112 +2717,63 @@ def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
         matched_any = False
         grouped = {}
 
+        # 1) Normal exact/keyword matching from Apps Config and notification keywords.
         for parameter_key, parameter, group_name in iter_remote_config_parameters(template):
             if not is_notification_parameter_key(parameter_key, explicit_keys):
                 continue
 
             matched_any = True
-            value_type = parameter.get("valueType", "STRING")
+            direct_count, parameter_grouped = append_daily_notification_rows_from_parameter(
+                rows=rows,
+                base=base,
+                parameter_key=parameter_key,
+                parameter=parameter,
+                group_name=group_name,
+                condition_lookup=condition_lookup,
+                condition_priority=condition_priority,
+                version_number=version_number,
+                update_time=update_time,
+                update_user=update_user,
+                updated_at=updated_at,
+                source_label="Remote Config",
+                status_label="SUCCESS",
+            )
+            grouped.update(parameter_grouped)
 
-            for value_row in get_parameter_value_rows(parameter, condition_lookup, condition_priority):
-                for plain_value in value_object_to_plain_values(value_row["value_object"]):
-                    raw_value = plain_value["value"]
-                    experiment_id = plain_value["experiment_id"]
-                    variant_id = plain_value["variant_id"]
-                    variant_suffix = f" / Variant {variant_id}" if variant_id else ""
-                    value_source = value_row["value_source"] + variant_suffix
-                    items = extract_notification_items_from_value(raw_value, parameter_key)
+        # 2) Fallback content scan. This catches names such as title_1/body_1/time_1
+        # or JSON values that contain title/body/time even if the parameter key does not contain notification.
+        if not matched_any and not explicit_keys:
+            for parameter_key, parameter, group_name in iter_remote_config_parameters(template):
+                scan_parameter = False
+                for value_row in get_parameter_value_rows(parameter, condition_lookup, condition_priority):
+                    for plain_value in value_object_to_plain_values(value_row["value_object"]):
+                        if value_has_notification_content_signal(parameter_key, plain_value["value"]):
+                            scan_parameter = True
+                            break
+                    if scan_parameter:
+                        break
 
-                    if not items:
-                        continue
+                if not scan_parameter:
+                    continue
 
-                    for item_index, item in enumerate(items, start=1):
-                        field_type = item.get("field_type", "")
-                        if field_type == "time":
-                            simple_field_value = item.get("send_time", "")
-                        elif field_type in ["title", "body", "days"]:
-                            simple_field_value = item.get(field_type, "")
-                        else:
-                            simple_field_value = ""
-
-                        if field_type and simple_field_value and len(items) == 1:
-                            group_key = (
-                                value_row["condition_name"],
-                                experiment_id,
-                                variant_id,
-                                get_group_key_from_parameter_key(parameter_key, field_type),
-                            )
-                            grouped.setdefault(
-                                group_key,
-                                {
-                                    "parameter_keys": set(),
-                                    "group_name": group_name,
-                                    "value_source": value_source,
-                                    "condition_name": value_row["condition_name"],
-                                    "condition_priority": value_row["condition_priority"],
-                                    "condition_expression": value_row["condition_expression"],
-                                    "value_type": value_type,
-                                    "experiment_id": experiment_id,
-                                    "variant_id": variant_id,
-                                    "title": "",
-                                    "body": "",
-                                    "send_time": "",
-                                    "days": "",
-                                    "schedule_type": "Daily / Firebase configured",
-                                    "timezone": "",
-                                    "raw_values": [],
-                                },
-                            )
-                            grouped[group_key]["parameter_keys"].add(parameter_key)
-                            grouped[group_key]["raw_values"].append(f"{parameter_key}: {raw_value}")
-
-                            if field_type == "title":
-                                grouped[group_key]["title"] = simple_field_value
-                            elif field_type == "body":
-                                grouped[group_key]["body"] = simple_field_value
-                            elif field_type == "time":
-                                grouped[group_key]["send_time"] = simple_field_value
-                            elif field_type == "days":
-                                grouped[group_key]["days"] = simple_field_value
-                            continue
-
-                        notification_no = item.get("notification_id") or item_index
-                        title = item.get("title", "")
-                        body = item.get("body", "")
-                        send_time = item.get("send_time", "")
-                        schedule_type = item.get("schedule_type", "") or "Daily / Firebase configured"
-                        days = item.get("days", "")
-                        timezone = item.get("timezone", "")
-                        raw_item = item.get("raw_value", raw_value)
-
-                        rows.append(
-                            base
-                            + [
-                                "Remote Config",
-                                parameter_key,
-                                group_name,
-                                notification_no,
-                                title,
-                                body,
-                                send_time,
-                                schedule_type,
-                                days,
-                                timezone,
-                                value_source,
-                                value_type,
-                                value_row["condition_name"],
-                                value_row["condition_priority"],
-                                value_row["condition_expression"],
-                                experiment_id,
-                                variant_id,
-                                version_number,
-                                update_time,
-                                update_user,
-                                "SUCCESS",
-                                build_daily_notification_recommendation(title, body, send_time, raw_item),
-                                updated_at,
-                            ]
-                        )
+                matched_any = True
+                direct_count, parameter_grouped = append_daily_notification_rows_from_parameter(
+                    rows=rows,
+                    base=base,
+                    parameter_key=parameter_key,
+                    parameter=parameter,
+                    group_name=group_name,
+                    condition_lookup=condition_lookup,
+                    condition_priority=condition_priority,
+                    version_number=version_number,
+                    update_time=update_time,
+                    update_user=update_user,
+                    updated_at=updated_at,
+                    source_label="Remote Config / Content Scan",
+                    status_label="POSSIBLE MATCH",
+                    recommendation_prefix="Parameter key did not match notification keywords; found by scanning value/content.",
+                )
+                grouped.update(parameter_grouped)
 
         for group_data in grouped.values():
             parameter_keys = ", ".join(sorted(group_data["parameter_keys"]))
@@ -2647,6 +2781,9 @@ def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
             title = group_data.get("title", "")
             body = group_data.get("body", "")
             send_time = group_data.get("send_time", "")
+            recommendation = build_daily_notification_recommendation(title, body, send_time, raw_values)
+            if "Remote Config / Content Scan" in str(group_data.get("source_label", "")):
+                recommendation = "Possible match found by content scan. " + recommendation
 
             rows.append(
                 base
@@ -2672,7 +2809,7 @@ def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
                     update_time,
                     update_user,
                     "SUCCESS",
-                    build_daily_notification_recommendation(title, body, send_time, raw_values),
+                    recommendation,
                     updated_at,
                 ]
             )
@@ -2683,7 +2820,11 @@ def build_daily_notification_rows_for_app(app: AppConfig) -> list[list]:
                 make_daily_notification_empty_row(
                     base,
                     "NO NOTIFICATION CONFIG FOUND",
-                    f"No Remote Config parameter matched notification keys/keywords: {search_note}",
+                    (
+                        "No Remote Config parameter matched notification keys/keywords or notification-like JSON/text content. "
+                        f"Search used: {search_note}. Add exact Remote Config keys in Apps Config column J, "
+                        "or ask developers to store/log notification title, body and send time."
+                    ),
                     updated_at,
                     version_number,
                     update_time,
@@ -2880,17 +3021,125 @@ def make_fcm_delivery_empty_row(
     ]
 
 
-def get_fcm_delivery_data(firebase_project_id: str, firebase_app_id: str) -> dict:
-    project_id = str(firebase_project_id).strip()
-    app_id = str(firebase_app_id).strip()
+def looks_like_firebase_app_id(value: str) -> bool:
+    value = str(value or "").strip()
+    return re.match(r"^1:\d+:(android|ios|web):", value) is not None
 
-    if not project_id:
+
+def list_firebase_android_apps(project_identifier: str) -> list[dict]:
+    project_identifier = str(project_identifier or "").strip()
+    if not project_identifier:
+        return []
+
+    apps = []
+    page_token = ""
+
+    while True:
+        parent = f"projects/{quote(project_identifier, safe='-') }"
+        url = f"{config.firebase_management_api_base}/{parent}/androidApps"
+        params = {"pageSize": 100}
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = get_notification_api_session().get(
+            url,
+            params=params,
+            timeout=config.firebase_remote_config_timeout,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Firebase Management API error {response.status_code}: {response.text}"
+            )
+
+        payload = response.json()
+        apps.extend(payload.get("apps", []) or [])
+        page_token = payload.get("nextPageToken", "")
+        if not page_token:
+            break
+
+    return apps
+
+
+def choose_firebase_android_app(app: AppConfig, apps: list[dict]) -> dict | None:
+    if not apps:
+        return None
+
+    wanted = str(app.firebase_app_id or "").strip().lower()
+    app_name = str(app.app_name or "").strip().lower()
+
+    # Exact Firebase app id match.
+    if wanted:
+        for item in apps:
+            if str(item.get("appId", "")).lower() == wanted:
+                return item
+
+    # Package name match, if the user entered package name instead of Firebase App ID.
+    if wanted:
+        for item in apps:
+            if str(item.get("packageName", "")).lower() == wanted:
+                return item
+
+    # Display/package fuzzy match with the App Name column.
+    if app_name:
+        for item in apps:
+            display = str(item.get("displayName", "")).strip().lower()
+            package = str(item.get("packageName", "")).strip().lower()
+            if display and (display in app_name or app_name in display):
+                return item
+            if package and (package in app_name or app_name in package):
+                return item
+
+    if len(apps) == 1:
+        return apps[0]
+
+    return None
+
+
+def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
+    project_identifier = str(app.firebase_project_id or "").strip()
+    configured_app_id = str(app.firebase_app_id or "").strip()
+
+    if not project_identifier:
         raise ValueError("Firebase Project ID is empty in Apps Config.")
 
-    if not app_id:
-        raise ValueError("Firebase App ID is empty in Apps Config.")
+    if not configured_app_id:
+        # Try to auto-find the app when only one Android app exists in the project.
+        android_apps = list_firebase_android_apps(project_identifier)
+        selected = choose_firebase_android_app(app, android_apps)
+        if selected:
+            return (
+                selected.get("projectId") or project_identifier,
+                selected.get("appId", ""),
+                "Firebase App ID was empty; auto-resolved from Firebase Android apps list.",
+            )
+        raise ValueError("Firebase App ID is empty in Apps Config and could not be auto-resolved from Firebase Android apps.")
 
-    parent = f"projects/{project_id}/androidApps/{quote(app_id, safe='')}"
+    # If the value already looks like a Firebase App ID, use it first. We still may retry using Management API on 400.
+    if looks_like_firebase_app_id(configured_app_id):
+        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
+
+    # If the user entered a package name or display name, resolve it through Firebase Management API.
+    android_apps = list_firebase_android_apps(project_identifier)
+    selected = choose_firebase_android_app(app, android_apps)
+    if selected:
+        return (
+            selected.get("projectId") or project_identifier,
+            selected.get("appId", ""),
+            f"Firebase App ID auto-resolved from Apps Config value '{configured_app_id}'.",
+        )
+
+    raise ValueError(
+        "Invalid Firebase App ID. Apps Config column H must be Android Firebase App ID like "
+        "1:1234567890:android:abcdef, or a package name that can be resolved from Firebase Management API."
+    )
+
+
+def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool = False) -> dict:
+    project_part = quote(str(project_id).strip(), safe="-")
+    app_safe = "" if encode_colons else ":"
+    app_part = quote(str(app_id).strip(), safe=app_safe)
+    parent = f"projects/{project_part}/androidApps/{app_part}"
     url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
     response = get_notification_api_session().get(
         url,
@@ -2904,6 +3153,66 @@ def get_fcm_delivery_data(firebase_project_id: str, firebase_app_id: str) -> dic
         )
 
     return response.json()
+
+
+def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
+    project_id, app_id, resolution_note = resolve_fcm_project_and_app_id(app)
+
+    try:
+        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=False)
+        payload["_resolution_note"] = resolution_note
+        payload["_resolved_project_id"] = project_id
+        payload["_resolved_app_id"] = app_id
+        return payload
+    except RuntimeError as error:
+        error_text = str(error)
+
+        # Fallback for API gateways that expect the Firebase app ID percent-encoded.
+        if "400" in error_text or "INVALID_ARGUMENT" in error_text:
+            try:
+                payload = request_fcm_delivery_data(project_id, app_id, encode_colons=True)
+                payload["_resolution_note"] = resolution_note + " Retried with encoded Firebase App ID."
+                payload["_resolved_project_id"] = project_id
+                payload["_resolved_app_id"] = app_id
+                return payload
+            except RuntimeError:
+                pass
+
+        # If direct app ID failed, try Management API to normalize numeric project number/package/display values.
+        try:
+            android_apps = list_firebase_android_apps(app.firebase_project_id)
+            selected = choose_firebase_android_app(app, android_apps)
+            if selected:
+                normalized_project_id = selected.get("projectId") or project_id
+                normalized_app_id = selected.get("appId") or app_id
+                payload = request_fcm_delivery_data(normalized_project_id, normalized_app_id, encode_colons=False)
+                payload["_resolution_note"] = "Retried after resolving app through Firebase Management API."
+                payload["_resolved_project_id"] = normalized_project_id
+                payload["_resolved_app_id"] = normalized_app_id
+                return payload
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            error_text
+            + " | Check Apps Config: Firebase Project ID should be the real Firebase project ID, "
+            "and Firebase App ID should be the Android appId from Firebase project settings, not only project number/package name."
+        )
+
+
+def get_fcm_delivery_data(firebase_project_id: str, firebase_app_id: str) -> dict:
+    temp_app = AppConfig(
+        app_name="",
+        property_id="",
+        home_screen_name="",
+        screen_field="",
+        firebase_project_id=firebase_project_id,
+        firebase_project_name="",
+        firebase_app_id=firebase_app_id,
+        time_capping_parameter="",
+        daily_notification_parameters="",
+    )
+    return get_fcm_delivery_data_for_app(temp_app)
 
 
 def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
@@ -2921,7 +3230,7 @@ def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
     ]
 
     try:
-        response = get_fcm_delivery_data(app.firebase_project_id, app.firebase_app_id)
+        response = get_fcm_delivery_data_for_app(app)
         delivery_rows = response.get("androidDeliveryData", []) or []
 
         if not delivery_rows:
