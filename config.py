@@ -51,10 +51,10 @@ class Config:
     personalized_ux_sheet: str
     remote_config_sheet: str
     time_capping_ab_sheet: str
+    iap_screen_ab_sheet: str
     daily_notifications_sheet: str
     ga4_notification_events_sheet: str
     fcm_delivery_sheet: str
-    bigquery_export_sheet: str
 
     start_date: str
     end_date: str
@@ -69,6 +69,8 @@ class Config:
     remote_config_app_version_limit: int
 
     time_capping_parameter: str
+    iap_screen_parameter: str
+    iap_screen_parameter_keywords: str
     remote_config_namespace: str
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
@@ -114,6 +116,10 @@ def load_config() -> Config:
             "TIME_CAPPING_AB_SHEET",
             "Firebase AB Time Capping",
         ),
+        iap_screen_ab_sheet=optional_env(
+            "IAP_SCREEN_AB_SHEET",
+            "Firebase AB IAP Screen",
+        ),
         daily_notifications_sheet=optional_env(
             "DAILY_NOTIFICATIONS_SHEET",
             "Firebase Daily Notifications",
@@ -125,10 +131,6 @@ def load_config() -> Config:
         fcm_delivery_sheet=optional_env(
             "FCM_DELIVERY_SHEET",
             "Firebase Notification Delivery",
-        ),
-        bigquery_export_sheet=optional_env(
-            "BIGQUERY_EXPORT_SHEET",
-            "BigQuery Unified Export",
         ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
@@ -155,6 +157,14 @@ def load_config() -> Config:
         time_capping_parameter=optional_env(
             "TIME_CAPPING_PARAMETER",
             "ad_time_capping",
+        ),
+        iap_screen_parameter=optional_env(
+            "IAP_SCREEN_PARAMETER",
+            "iap_screen",
+        ),
+        iap_screen_parameter_keywords=optional_env(
+            "IAP_SCREEN_PARAMETER_KEYWORDS",
+            "iap_screen,iap_screen_variant,iap_paywall,iap,paywall,paywall_screen,premium_screen,subscription_screen,subs_screen,subscribe_screen,purchase_screen,in_app_purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen",
         ),
         remote_config_namespace=optional_env(
             "REMOTE_CONFIG_NAMESPACE",
