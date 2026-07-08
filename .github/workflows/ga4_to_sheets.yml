@@ -40,15 +40,17 @@ jobs:
           PERSONALIZED_UX_SHEET: GA4 Personalized User Experience
           REMOTE_CONFIG_SHEET: GA4 Remote Configuration
           TIME_CAPPING_AB_SHEET: Firebase AB Time Capping
+          IAP_SCREEN_AB_SHEET: Firebase AB IAP Screen
           DAILY_NOTIFICATIONS_SHEET: Firebase Daily Notifications
           GA4_NOTIFICATION_EVENTS_SHEET: GA4 Notification Events
           FCM_DELIVERY_SHEET: Firebase Notification Delivery
-          BIGQUERY_EXPORT_SHEET: BigQuery Unified Export
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
           REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
           REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '10' }}
           TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
+          IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
+          IAP_SCREEN_PARAMETER_KEYWORDS: ${{ vars.IAP_SCREEN_PARAMETER_KEYWORDS || 'iap_screen,iap_screen_variant,iap_paywall,iap,paywall,paywall_screen,premium_screen,subscription_screen,subs_screen,subscribe_screen,purchase_screen,in_app_purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen' }}
           REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
           FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
           DAILY_NOTIFICATION_PARAMETERS: ${{ vars.DAILY_NOTIFICATION_PARAMETERS || '' }}
