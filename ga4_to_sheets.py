@@ -469,14 +469,59 @@ def get_firebase_app_id_from_stream(stream: dict) -> str:
     return str(android_data.get("firebaseAppId", "")).strip()
 
 
-def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
+def get_stream_display_name(stream: dict) -> str:
+    return str(stream.get("displayName", "")).strip()
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def get_package_tail(package_name: str) -> str:
+    return str(package_name or "").strip().split(".")[-1]
+
+
+def stream_matches_app_name(stream: dict, app_name: str) -> bool:
+    app_key = normalize_match_text(app_name)
+
+    if not app_key:
+        return False
+
+    package_name = get_android_package_name_from_stream(stream)
+    candidates = [
+        get_stream_display_name(stream),
+        package_name,
+        get_package_tail(package_name),
+    ]
+
+    for candidate in candidates:
+        candidate_key = normalize_match_text(candidate)
+
+        if not candidate_key:
+            continue
+
+        if candidate_key == app_key:
+            return True
+
+        if app_key in candidate_key or candidate_key in app_key:
+            return True
+
+    return False
+
+
+def fetch_ga4_package_name(
+    property_id: str,
+    firebase_app_id: str = "",
+    app_name: str = "",
+) -> str:
     property_id = str(property_id).strip()
     firebase_app_id = str(firebase_app_id).strip()
+    app_name = str(app_name).strip()
 
     if not property_id:
         return ""
 
-    cache_key = f"{property_id}|{firebase_app_id}"
+    cache_key = f"{property_id}|{firebase_app_id}|{app_name}"
 
     if cache_key in package_name_cache:
         return package_name_cache[cache_key]
@@ -520,18 +565,35 @@ def fetch_ga4_package_name(property_id: str, firebase_app_id: str = "") -> str:
                     package_name_cache[cache_key] = package_name
                     return package_name
 
-        package_names = []
-        seen = set()
+        matched_streams = [
+            stream
+            for stream in android_streams
+            if stream_matches_app_name(stream, app_name)
+        ]
 
-        for stream in android_streams:
-            package_name = get_android_package_name_from_stream(stream)
-            if package_name and package_name not in seen:
-                package_names.append(package_name)
-                seen.add(package_name)
+        if len(matched_streams) == 1:
+            package_name = get_android_package_name_from_stream(matched_streams[0])
+            package_name_cache[cache_key] = package_name
+            return package_name
 
-        package_name = ", ".join(package_names)
-        package_name_cache[cache_key] = package_name
-        return package_name
+        if len(android_streams) == 1:
+            package_name = get_android_package_name_from_stream(android_streams[0])
+            package_name_cache[cache_key] = package_name
+            return package_name
+
+        # Important: do not join multiple package names into one cell.
+        # A GA4 property can contain multiple Android data streams, and those
+        # are separate apps/packages. Joining them here causes the combined
+        # report to merge different apps into one row.
+        if len(android_streams) > 1:
+            print(
+                "Package name ambiguous for "
+                f"{app_name or property_id}. Add Firebase App ID in Apps Config "
+                "or make the GA4 data stream display name match the App Name."
+            )
+
+        package_name_cache[cache_key] = ""
+        return ""
 
     except Exception as error:
         status, error_text = classify_api_error(error)
@@ -620,6 +682,8 @@ def should_exclude_joined_column(header: str) -> bool:
         "firebase project id",
         "firebase project name",
         "firebase app id",
+        "home screen name",
+        "screen field",
     }
 
     if normalized in exact_excluded_headers:
@@ -669,6 +733,179 @@ def compact_unique_values(values: list[str]) -> str:
         return compacted[0]
 
     return " | ".join(compacted)
+
+
+def split_package_name_cell(package_name: str) -> list[str]:
+    text = str(package_name or "").strip()
+
+    if not text:
+        return []
+
+    # Handle old/ambiguous output safely if a previous run had multiple
+    # packages in one cell. Package names do not contain comma or pipe.
+    parts = [part.strip() for part in re.split(r"\s*(?:,|\|)\s*", text)]
+    parts = [part for part in parts if part]
+
+    output = []
+    seen = set()
+
+    for part in parts:
+        if part in seen:
+            continue
+
+        output.append(part)
+        seen.add(part)
+
+    return output
+
+
+def merge_values_from_package_maps(
+    package_order: list[str],
+    package_maps: list[dict[str, str]],
+) -> dict[str, str]:
+    merged = {}
+
+    for package_name in package_order:
+        merged[package_name] = compact_unique_values([
+            package_map.get(package_name, "")
+            for package_map in package_maps
+        ])
+
+    return merged
+
+
+def should_force_merge_joined_column(header: str) -> bool:
+    return normalize_header_name(header) in {"app name", "property id"}
+
+
+def get_context_column_candidates(sheet_name: str) -> list[str]:
+    normalized_sheet = normalize_header_name(friendly_joined_sheet_label(sheet_name))
+
+    if "audience segment" in normalized_sheet:
+        return ["Audience Segment"]
+
+    if "personalized user experience" in normalized_sheet:
+        return ["Personalization Breakdown", "Dimension Value"]
+
+    if "remote configuration" in normalized_sheet:
+        return ["Remote Config Area", "Rule / Type", "Value"]
+
+    if "ab time capping" in normalized_sheet or "ab iap screen" in normalized_sheet:
+        return ["Remote Config Parameter", "Condition / Variant", "Remote Config Value"]
+
+    if "daily notification" in normalized_sheet:
+        return ["Notification No", "Condition / Audience", "Notification Title"]
+
+    if "notification event" in normalized_sheet:
+        return ["Notification Event", "GA4 Date Hour Minute"]
+
+    if "notification delivery" in normalized_sheet:
+        return ["FCM Date", "Analytics Label"]
+
+    return []
+
+
+def get_context_for_joined_value(
+    sheet_name: str,
+    header: list[str],
+    row: list,
+    column_header: str,
+) -> tuple[str, str]:
+    # When one metric column has multiple rows for the same package, the joined
+    # report uses a pipe-separated value. This context tells the user which row
+    # label each piped value belongs to, for example:
+    # Audience Segment: All Users | US Users | Paid Traffic / Active Users.
+    column_indexes = {normalize_header_name(name): index for index, name in enumerate(header)}
+    context_parts = []
+    context_header_parts = []
+
+    for candidate in get_context_column_candidates(sheet_name):
+        if normalize_header_name(candidate) == normalize_header_name(column_header):
+            continue
+
+        index = column_indexes.get(normalize_header_name(candidate))
+        if index is None:
+            continue
+
+        value = get_row_value(row, index)
+        if not value:
+            continue
+
+        context_parts.append(value)
+        context_header_parts.append(candidate)
+
+    if not context_parts:
+        return "", ""
+
+    return " / ".join(context_header_parts), " / ".join(context_parts)
+
+
+def compact_joined_entries(entries: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    has_context = any(context for _, context in entries)
+
+    if not has_context:
+        values = [value for value, _ in entries]
+        return compact_unique_values(values), []
+
+    values = []
+    contexts = []
+    seen_pairs = set()
+
+    for value, context in entries:
+        value = str(value or "").strip()
+        context = str(context or "").strip()
+
+        if not value:
+            continue
+
+        pair = (context, value)
+        if pair in seen_pairs:
+            continue
+
+        seen_pairs.add(pair)
+        values.append(value)
+
+        if context:
+            contexts.append(context)
+
+    return " | ".join(values), contexts
+
+
+def compact_context_values(values: list[str], max_values: int = 12) -> str:
+    compacted = []
+    seen = set()
+
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+
+        compacted.append(text)
+        seen.add(text)
+
+        if len(compacted) >= max_values:
+            break
+
+    return " | ".join(compacted)
+
+
+def make_context_aware_header(
+    sheet_name: str,
+    column_header: str,
+    context_header_names: list[str],
+    context_values: list[str],
+) -> str:
+    sheet_label = friendly_joined_sheet_label(sheet_name)
+    context_header = compact_unique_values(context_header_names)
+    context_display = compact_context_values(context_values)
+
+    if context_header and context_display:
+        return f"{sheet_label} - {context_header}: {context_display} / {column_header}"
+
+    if context_header:
+        return f"{sheet_label} - {context_header} / {column_header}"
+
+    return f"{sheet_label} - {column_header}"
 
 
 def package_maps_are_same_for_apps(
@@ -735,7 +972,9 @@ def build_joined_package_report_rows(
 ) -> list[list]:
     package_order = []
     package_seen = set()
-    field_values: dict[tuple[str, str], dict[str, list[str]]] = {}
+    field_entries: dict[tuple[str, str], dict[str, list[tuple[str, str]]]] = {}
+    field_context_headers: dict[tuple[str, str], list[str]] = {}
+    field_context_values: dict[tuple[str, str], list[str]] = {}
     field_order: list[tuple[str, str]] = []
     base_header_order: list[str] = []
     base_header_seen = set()
@@ -767,8 +1006,10 @@ def build_joined_package_report_rows(
 
             key = (sheet_name, column_header)
 
-            if key not in field_values:
-                field_values[key] = {}
+            if key not in field_entries:
+                field_entries[key] = {}
+                field_context_headers[key] = []
+                field_context_values[key] = []
                 field_order.append(key)
 
             if column_header not in base_header_seen:
@@ -776,42 +1017,62 @@ def build_joined_package_report_rows(
                 base_header_order.append(column_header)
 
         for row in rows[1:]:
-            package_name = get_row_value(row, package_col)
+            package_names = split_package_name_cell(get_row_value(row, package_col))
 
-            if not package_name:
+            if not package_names:
                 continue
 
-            if package_name not in package_seen:
-                package_seen.add(package_name)
-                package_order.append(package_name)
+            for package_name in package_names:
+                if package_name not in package_seen:
+                    package_seen.add(package_name)
+                    package_order.append(package_name)
 
-            for column_index, column_header in enumerate(header):
-                column_header = str(column_header or "").strip()
+                for column_index, column_header in enumerate(header):
+                    column_header = str(column_header or "").strip()
 
-                if not column_header or column_header == "Package Name":
-                    continue
+                    if not column_header or column_header == "Package Name":
+                        continue
 
-                if should_exclude_joined_column(column_header):
-                    continue
+                    if should_exclude_joined_column(column_header):
+                        continue
 
-                value = get_row_value(row, column_index)
+                    value = get_row_value(row, column_index)
 
-                if not value:
-                    continue
+                    if not value:
+                        continue
 
-                key = (sheet_name, column_header)
-                field_values.setdefault(key, {}).setdefault(package_name, []).append(value)
+                    context_header, context_value = get_context_for_joined_value(
+                        sheet_name=sheet_name,
+                        header=header,
+                        row=row,
+                        column_header=column_header,
+                    )
+
+                    key = (sheet_name, column_header)
+                    field_entries.setdefault(key, {}).setdefault(package_name, []).append(
+                        (value, context_value)
+                    )
+
+                    if context_header and context_header not in field_context_headers.setdefault(key, []):
+                        field_context_headers[key].append(context_header)
+
+                    if context_value:
+                        field_context_values.setdefault(key, []).append(context_value)
 
     if not package_order:
         return [["Package Name"]]
 
     compact_field_values: dict[tuple[str, str], dict[str, str]] = {}
 
-    for key, package_values in field_values.items():
-        compact_field_values[key] = {
-            package_name: compact_unique_values(values)
-            for package_name, values in package_values.items()
-        }
+    for key, package_entries in field_entries.items():
+        compact_field_values[key] = {}
+
+        for package_name, entries in package_entries.items():
+            compact_value, package_contexts = compact_joined_entries(entries)
+            compact_field_values[key][package_name] = compact_value
+
+            if package_contexts:
+                field_context_values.setdefault(key, []).extend(package_contexts)
 
     output_specs = []
 
@@ -827,6 +1088,12 @@ def build_joined_package_report_rows(
         if not package_maps:
             continue
 
+        if should_force_merge_joined_column(base_header):
+            merged_map = merge_values_from_package_maps(package_order, package_maps)
+            if any(merged_map.values()):
+                output_specs.append((base_header, merged_map))
+            continue
+
         if package_maps_are_same_for_apps(package_order, package_maps):
             merged_map = merge_package_maps(package_order, package_maps)
             if any(merged_map.values()):
@@ -840,7 +1107,12 @@ def build_joined_package_report_rows(
             if not any(package_map.values()):
                 continue
 
-            output_header = f"{friendly_joined_sheet_label(sheet_name)} - {column_header}"
+            output_header = make_context_aware_header(
+                sheet_name=sheet_name,
+                column_header=column_header,
+                context_header_names=field_context_headers.get(key, []),
+                context_values=field_context_values.get(key, []),
+            )
             output_specs.append((output_header, package_map))
 
     priority_headers = ["App Name", "Property ID"]
@@ -868,7 +1140,6 @@ def build_joined_package_report_rows(
         output_rows.append(row)
 
     return output_rows
-
 
 # =========================
 # FUNNEL REPORT
@@ -4108,6 +4379,11 @@ def main():
     print(f"Total enabled apps found: {len(apps)}")
 
     package_name_lookup = {}
+    property_id_counts = {}
+
+    for app in apps:
+        property_id_key = str(app.property_id).strip()
+        property_id_counts[property_id_key] = property_id_counts.get(property_id_key, 0) + 1
 
     for app in apps:
         app_name_key = str(app.app_name).strip()
@@ -4115,10 +4391,18 @@ def main():
         package_name = fetch_ga4_package_name(
             app.property_id,
             app.firebase_app_id,
+            app.app_name,
         )
         package_name_lookup[f"{app_name_key}|{property_id_key}"] = package_name
 
-        if property_id_key and property_id_key not in package_name_lookup:
+        # Use the property-level fallback only when that property maps to a
+        # single configured app. This prevents apps sharing one GA4 property
+        # from being incorrectly merged under one package name.
+        if (
+            property_id_key
+            and property_id_counts.get(property_id_key, 0) == 1
+            and package_name
+        ):
             package_name_lookup[property_id_key] = package_name
 
         if package_name:
@@ -4798,8 +5082,17 @@ def main():
     for sheet_name, rows in report_tables:
         write_report_sheet(sheet_name, rows, package_name_lookup)
 
+    joined_report_tables = [
+        (sheet_name, rows)
+        for sheet_name, rows in report_tables
+        if sheet_name not in {
+            config.details_sheet,
+            config.retention_details_sheet,
+        }
+    ]
+
     joined_package_rows = build_joined_package_report_rows(
-        report_tables,
+        joined_report_tables,
         package_name_lookup,
     )
     write_sheet(config.combined_joined_sheet, joined_package_rows)
