@@ -1,9 +1,10 @@
 name: GA4 to Google Sheets
 
 on:
-  workflow_dispatch
+  workflow_dispatch:
 
- 
+  schedule:
+    - cron: "0 4 * * *"
 
 jobs:
   ga4-to-sheets:
@@ -31,33 +32,13 @@ jobs:
           RETENTION_DAYS: ${{ vars.RETENTION_DAYS || '7' }}
 
           APPS_CONFIG_SHEET: Apps Config
-          SUMMARY_SHEET: GA4 Funnel Summary
-          DETAILS_SHEET: GA4 Funnel Details
-          USER_SESSION_SHEET: GA4 User Session Summary
-          RETENTION_DETAILS_SHEET: GA4 Retention Details
-          AUDIENCE_SEGMENTS_SHEET: GA4 Audience Segments
-          PERSONALIZED_UX_SHEET: GA4 Personalized User Experience
-          REMOTE_CONFIG_SHEET: GA4 Remote Configuration
-          TIME_CAPPING_AB_SHEET: Firebase AB Time Capping
-          IAP_SCREEN_AB_SHEET: Firebase AB IAP Screen
-          DAILY_NOTIFICATIONS_SHEET: Firebase Daily Notifications
-          GA4_NOTIFICATION_EVENTS_SHEET: GA4 Notification Events
-          FCM_DELIVERY_SHEET: Firebase Notification Delivery
           MERGED_SHEET: GA4 Merged Data
 
-          PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '10' }}
-          REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
-          REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '10' }}
-          TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
-          IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
-          IAP_SCREEN_PARAMETER_KEYWORDS: ${{ vars.IAP_SCREEN_PARAMETER_KEYWORDS || 'iap_screen,iap_screen_variant,iap_paywall,iap,paywall,paywall_screen,premium_screen,subscription_screen,subs_screen,subscribe_screen,purchase_screen,in_app_purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen' }}
-          REMOTE_CONFIG_NAMESPACE: ${{ vars.REMOTE_CONFIG_NAMESPACE || 'firebase' }}
-          FIREBASE_REMOTE_CONFIG_TIMEOUT: ${{ vars.FIREBASE_REMOTE_CONFIG_TIMEOUT || '30' }}
-          DAILY_NOTIFICATION_PARAMETERS: ${{ vars.DAILY_NOTIFICATION_PARAMETERS || '' }}
-          NOTIFICATION_PARAMETER_KEYWORDS: ${{ vars.NOTIFICATION_PARAMETER_KEYWORDS || 'notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm' }}
           NOTIFICATION_EVENT_NAMES: ${{ vars.NOTIFICATION_EVENT_NAMES || 'notification_receive,notification_foreground,notification_open,notification_dismiss' }}
-          NOTIFICATION_EVENT_LIMIT: ${{ vars.NOTIFICATION_EVENT_LIMIT || '500' }}
-          FCM_DATA_PAGE_SIZE: ${{ vars.FCM_DATA_PAGE_SIZE || '1000' }}
+          KEY_EVENT_NAMES: ${{ vars.KEY_EVENT_NAMES || 'ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start' }}
+
+          FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
+          CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
           GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
 
           DEFAULT_HOME_SCREEN_NAME: MainActivity
