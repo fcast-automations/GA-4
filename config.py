@@ -81,6 +81,7 @@ class Config:
     notification_event_limit: int
     fcm_data_api_base: str
     firebase_management_api_base: str
+    ga4_admin_api_base: str
     fcm_data_page_size: int
 
 
@@ -202,6 +203,10 @@ def load_config() -> Config:
         firebase_management_api_base=optional_env(
             "FIREBASE_MANAGEMENT_API_BASE",
             "https://firebase.googleapis.com/v1beta1",
+        ),
+        ga4_admin_api_base=optional_env(
+            "GA4_ADMIN_API_BASE",
+            "https://analyticsadmin.googleapis.com/v1beta",
         ),
         fcm_data_page_size=optional_int_env(
             "FCM_DATA_PAGE_SIZE",
