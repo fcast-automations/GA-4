@@ -70,6 +70,9 @@ class Config:
     remote_config_namespace: str
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
+    fcm_data_api_base: str
+    firebase_management_api_base: str
+    fcm_data_page_size: int
 
     fetch_package_name: bool
     ga4_admin_api_base: str
@@ -120,6 +123,15 @@ def load_config() -> Config:
             "https://firebaseremoteconfig.googleapis.com/v1",
         ),
         firebase_remote_config_timeout=optional_int_env("FIREBASE_REMOTE_CONFIG_TIMEOUT", 30),
+        fcm_data_api_base=optional_env(
+            "FCM_DATA_API_BASE",
+            "https://fcmdata.googleapis.com/v1beta1",
+        ),
+        firebase_management_api_base=optional_env(
+            "FIREBASE_MANAGEMENT_API_BASE",
+            "https://firebase.googleapis.com/v1beta1",
+        ),
+        fcm_data_page_size=optional_int_env("FCM_DATA_PAGE_SIZE", 1000),
 
         fetch_package_name=optional_bool_env("FETCH_PACKAGE_NAME", True),
         ga4_admin_api_base=optional_env(
