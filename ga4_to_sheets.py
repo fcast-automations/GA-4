@@ -75,6 +75,32 @@ remote_config_session = None
 analytics_admin_session = None
 package_name_cache = {}
 
+# Google Sheets allows a maximum of 50,000 characters in one cell.
+# Keep a small buffer so generated summary cells never fail the Sheets API.
+MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
+MAX_MERGED_CELL_CHARS = 45000
+MAX_MERGED_VALUE_CHARS = 300
+MAX_MERGED_ROW_SUMMARIES_PER_SHEET = 8
+
+
+def trim_cell_value(value, max_chars: int = MAX_GOOGLE_SHEETS_CELL_CHARS):
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[: max_chars - 40] + " ... [trimmed to fit Google Sheets cell limit]"
+
+
+def sanitize_rows_for_google_sheets(rows: list[list]) -> list[list]:
+    return [
+        [trim_cell_value(value) for value in row]
+        for row in rows
+    ]
+
 
 def get_sheets_service():
     return build(
@@ -115,6 +141,7 @@ def ensure_sheet_exists(service, sheet_name: str):
 def write_sheet(sheet_name: str, rows: list[list]):
     service = get_sheets_service()
     ensure_sheet_exists(service, sheet_name)
+    rows = sanitize_rows_for_google_sheets(rows)
 
     service.spreadsheets().values().clear(
         spreadsheetId=config.spreadsheet_id,
@@ -679,12 +706,27 @@ def compact_sheet_row_summary(header: list[str], row: list) -> str:
 
         value = ""
         if index < len(row):
-            value = str(row[index]).strip()
+            value = trim_cell_value(row[index], MAX_MERGED_VALUE_CHARS).strip()
 
         if value:
             parts.append(f"{column_name}: {value}")
 
-    return "; ".join(parts)
+    return trim_cell_value("; ".join(parts), 3000)
+
+
+def compact_sheet_cell_summary(sheet_values: list[str]) -> str:
+    if not sheet_values:
+        return ""
+
+    visible_values = sheet_values[:MAX_MERGED_ROW_SUMMARIES_PER_SHEET]
+    hidden_count = len(sheet_values) - len(visible_values)
+
+    cell_value = " | ".join(visible_values)
+
+    if hidden_count > 0:
+        cell_value += f" | +{hidden_count} more row(s) in source sheet"
+
+    return trim_cell_value(cell_value, MAX_MERGED_CELL_CHARS)
 
 
 def build_merged_report_rows(
@@ -836,7 +878,7 @@ def build_merged_report_rows(
 
         for sheet_name in included_sheet_names:
             sheet_values = merged.get("_sheet_values", {}).get(sheet_name, [])
-            row.append(" | ".join(sheet_values))
+            row.append(compact_sheet_cell_summary(sheet_values))
 
         output_rows.append(row)
 
