@@ -5,30 +5,27 @@ from dataclasses import dataclass
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/firebase.remoteconfig",
+    "https://www.googleapis.com/auth/cloud-platform",
 ]
 
 
 def required_env(name: str) -> str:
     value = os.getenv(name)
-
     if value is None or str(value).strip() == "":
         raise ValueError(f"Missing required environment variable: {name}")
-
     return str(value).strip()
 
 
 def optional_env(name: str, default: str) -> str:
     value = os.getenv(name)
-
     if value is None or str(value).strip() == "":
         return default
-
     return str(value).strip()
 
 
 def optional_int_env(name: str, default: int) -> int:
     value = optional_env(name, str(default))
-
     try:
         return int(value)
     except ValueError:
@@ -36,14 +33,11 @@ def optional_int_env(name: str, default: int) -> int:
 
 
 def optional_bool_env(name: str, default: bool) -> bool:
-    value = optional_env(name, "true" if default else "false").strip().lower()
-
+    value = optional_env(name, "true" if default else "false").lower().strip()
     if value in {"1", "true", "yes", "y", "on"}:
         return True
-
     if value in {"0", "false", "no", "n", "off"}:
         return False
-
     raise ValueError(f"{name} must be true or false. Current value: {value}")
 
 
@@ -65,6 +59,17 @@ class Config:
 
     notification_event_names: str
     key_event_names: str
+    notification_parameter_keywords: str
+    personalized_top_n: int
+    remote_config_event_limit: int
+    remote_config_app_version_limit: int
+
+    time_capping_parameter: str
+    iap_screen_parameter: str
+    iap_screen_parameter_keywords: str
+    remote_config_namespace: str
+    firebase_remote_config_api_base: str
+    firebase_remote_config_timeout: int
 
     fetch_package_name: bool
     ga4_admin_api_base: str
@@ -95,6 +100,26 @@ def load_config() -> Config:
             "KEY_EVENT_NAMES",
             "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start",
         ),
+        notification_parameter_keywords=optional_env(
+            "NOTIFICATION_PARAMETER_KEYWORDS",
+            "notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm,title,body,message,time",
+        ),
+        personalized_top_n=optional_int_env("PERSONALIZED_TOP_N", 5),
+        remote_config_event_limit=optional_int_env("REMOTE_CONFIG_EVENT_LIMIT", 25),
+        remote_config_app_version_limit=optional_int_env("REMOTE_CONFIG_APP_VERSION_LIMIT", 10),
+
+        time_capping_parameter=optional_env("TIME_CAPPING_PARAMETER", "ad_time_capping"),
+        iap_screen_parameter=optional_env("IAP_SCREEN_PARAMETER", "iap_screen"),
+        iap_screen_parameter_keywords=optional_env(
+            "IAP_SCREEN_PARAMETER_KEYWORDS",
+            "iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen",
+        ),
+        remote_config_namespace=optional_env("REMOTE_CONFIG_NAMESPACE", "firebase"),
+        firebase_remote_config_api_base=optional_env(
+            "FIREBASE_REMOTE_CONFIG_API_BASE",
+            "https://firebaseremoteconfig.googleapis.com/v1",
+        ),
+        firebase_remote_config_timeout=optional_int_env("FIREBASE_REMOTE_CONFIG_TIMEOUT", 30),
 
         fetch_package_name=optional_bool_env("FETCH_PACKAGE_NAME", True),
         ga4_admin_api_base=optional_env(
