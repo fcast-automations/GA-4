@@ -44,19 +44,17 @@ class AppConfig:
 
 def get_credentials():
     service_account_info = json.loads(config.service_account_json)
-    return service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=SCOPES,
-    )
+    return service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
 
 credentials = get_credentials()
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
 analytics_admin_session = None
+remote_config_session = None
 package_name_cache: dict[str, str] = {}
+remote_config_template_cache: dict[str, dict] = {}
 
 MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
-
 OLD_REPORT_SHEET_NAMES = {
     "GA4 Funnel Summary",
     "GA4 Funnel Details",
@@ -76,11 +74,9 @@ OLD_REPORT_SHEET_NAMES = {
 def trim_cell_value(value, max_chars: int = MAX_GOOGLE_SHEETS_CELL_CHARS):
     if value is None:
         return ""
-
     text = str(value)
     if len(text) <= max_chars:
         return text
-
     return text[: max_chars - 40] + " ... [trimmed to fit Google Sheets cell limit]"
 
 
@@ -97,15 +93,9 @@ def ensure_sheet_exists(service, sheet_name: str):
         spreadsheetId=config.spreadsheet_id,
         fields="sheets.properties(title)",
     ).execute()
-
-    existing = {
-        sheet.get("properties", {}).get("title", "")
-        for sheet in spreadsheet.get("sheets", [])
-    }
-
+    existing = {sheet.get("properties", {}).get("title", "") for sheet in spreadsheet.get("sheets", [])}
     if sheet_name in existing:
         return
-
     service.spreadsheets().batchUpdate(
         spreadsheetId=config.spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
@@ -115,24 +105,19 @@ def ensure_sheet_exists(service, sheet_name: str):
 def cleanup_old_report_sheets(service):
     if not config.cleanup_old_tabs:
         return
-
     spreadsheet = service.spreadsheets().get(
         spreadsheetId=config.spreadsheet_id,
         fields="sheets.properties(sheetId,title)",
     ).execute()
-
     protected = {config.apps_config_sheet, config.merged_sheet}
     requests = []
     names = []
-
     for sheet in spreadsheet.get("sheets", []):
         props = sheet.get("properties", {})
         title = props.get("title", "")
-
         if title in OLD_REPORT_SHEET_NAMES and title not in protected:
             requests.append({"deleteSheet": {"sheetId": props["sheetId"]}})
             names.append(title)
-
     if requests:
         service.spreadsheets().batchUpdate(
             spreadsheetId=config.spreadsheet_id,
@@ -145,13 +130,11 @@ def write_sheet(sheet_name: str, rows: list[list]):
     service = get_sheets_service()
     ensure_sheet_exists(service, sheet_name)
     cleanup_old_report_sheets(service)
-
     service.spreadsheets().values().clear(
         spreadsheetId=config.spreadsheet_id,
         range=f"{sheet_name}!A:ZZ",
         body={},
     ).execute()
-
     service.spreadsheets().values().update(
         spreadsheetId=config.spreadsheet_id,
         range=f"{sheet_name}!A1",
@@ -179,10 +162,8 @@ def get_apps_config_headers() -> list[str]:
 def ensure_apps_config_headers(service, values: list[list]):
     expected_headers = get_apps_config_headers()
     current_headers = values[0] if values else []
-
     if current_headers[: len(expected_headers)] == expected_headers:
         return
-
     service.spreadsheets().values().update(
         spreadsheetId=config.spreadsheet_id,
         range=f"{config.apps_config_sheet}!A1:K1",
@@ -204,34 +185,26 @@ def create_apps_config_template(service):
 def read_apps_config() -> list[AppConfig]:
     service = get_sheets_service()
     ensure_sheet_exists(service, config.apps_config_sheet)
-
     response = service.spreadsheets().values().get(
         spreadsheetId=config.spreadsheet_id,
         range=f"{config.apps_config_sheet}!A:K",
     ).execute()
-
     values = response.get("values", [])
-
     if len(values) <= 1:
         create_apps_config_template(service)
         raise SystemExit("Apps Config sheet was empty. Template created. Fill apps and run again.")
-
     ensure_apps_config_headers(service, values)
 
     apps: list[AppConfig] = []
-
     for index, row in enumerate(values[1:], start=2):
         enabled = row[0].strip().upper() if len(row) > 0 else ""
         app_name = row[1].strip() if len(row) > 1 else ""
         property_id = row[2].strip() if len(row) > 2 else ""
-
         if enabled not in {"TRUE", "YES", "1", "Y"}:
             continue
-
         if not app_name or not property_id:
             print(f"Skipping row {index}: App Name or Property ID is missing.")
             continue
-
         apps.append(
             AppConfig(
                 app_name=app_name,
@@ -246,45 +219,36 @@ def read_apps_config() -> list[AppConfig]:
                 iap_screen_parameter=(row[10].strip() if len(row) > 10 else ""),
             )
         )
-
     if not apps:
         raise SystemExit("No enabled apps found in Apps Config sheet.")
-
     return apps
 
 
 def resolve_ga4_date(value: str) -> str:
     value = str(value).strip()
     today = datetime.now(ZoneInfo(config.timezone)).date()
-
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return value
-
     if value.lower() == "today":
         return today.isoformat()
-
     if value.lower() == "yesterday":
         return (today - timedelta(days=1)).isoformat()
-
     match = re.fullmatch(r"(\d+)daysAgo", value, re.IGNORECASE)
     if match:
         return (today - timedelta(days=int(match.group(1)))).isoformat()
-
     return value
 
 
 def get_report_dates() -> list[str]:
     start = datetime.fromisoformat(resolve_ga4_date(config.start_date)).date()
     end = datetime.fromisoformat(resolve_ga4_date(config.end_date)).date()
-
     if start > end:
         raise ValueError(f"START_DATE must be on or before END_DATE. Current: {start} to {end}")
-
     return [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
 
 
 def ga4_date_to_iso(value: str) -> str:
-    value = str(value).strip()
+    value = str(value or "").strip()
     if re.fullmatch(r"\d{8}", value):
         return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
     return value
@@ -293,13 +257,11 @@ def ga4_date_to_iso(value: str) -> str:
 def split_csv(value: str) -> list[str]:
     seen = set()
     result = []
-
     for item in str(value or "").split(","):
         item = item.strip()
         if item and item not in seen:
             result.append(item)
             seen.add(item)
-
     return result
 
 
@@ -344,16 +306,21 @@ def format_seconds(seconds_value) -> str:
     hours = total // 3600
     minutes = (total % 3600) // 60
     seconds = total % 60
-
     if hours:
         return f"{hours}h {minutes}m {seconds}s"
     return f"{minutes}m {seconds}s"
 
 
+def lines_to_cell(lines: list[str], max_lines: int = 50) -> str:
+    clean = [str(line).strip() for line in lines if str(line).strip()]
+    if len(clean) > max_lines:
+        clean = clean[:max_lines] + [f"... {len(clean) - max_lines} more rows trimmed"]
+    return "\n".join(clean)
+
+
 def classify_api_error(error) -> tuple[str, str]:
     text = str(error)
     lower = text.lower()
-
     if any(term in lower for term in ["service_disabled", "has not been enabled", "api disabled", "api not enabled"]):
         return "API NOT ENABLED", text
     if any(term in lower for term in ["403", "permission denied", "access denied", "insufficient permissions"]):
@@ -373,29 +340,23 @@ def get_analytics_admin_session():
 def fetch_ga4_package_name(app: AppConfig) -> str:
     if not config.fetch_package_name:
         return ""
-
     cache_key = f"{app.property_id}|{app.firebase_app_id}"
     if cache_key in package_name_cache:
         return package_name_cache[cache_key]
-
     try:
         url = f"{config.ga4_admin_api_base}/properties/{app.property_id}/dataStreams"
         params = {"pageSize": 200}
         streams = []
-
         while True:
             response = get_analytics_admin_session().get(url, params=params, timeout=30)
             if response.status_code >= 400:
                 raise RuntimeError(f"GA4 Admin API error {response.status_code}: {response.text}")
-
             payload = response.json()
             streams.extend(payload.get("dataStreams", []) or [])
-
             token = payload.get("nextPageToken", "")
             if not token:
                 break
             params["pageToken"] = token
-
         android_streams = []
         for stream in streams:
             android = stream.get("androidAppStreamData", {}) or {}
@@ -403,24 +364,20 @@ def fetch_ga4_package_name(app: AppConfig) -> str:
             firebase_app_id = str(android.get("firebaseAppId", "")).strip()
             if package_name:
                 android_streams.append((package_name, firebase_app_id))
-
         if app.firebase_app_id:
             for package_name, firebase_app_id in android_streams:
                 if firebase_app_id == app.firebase_app_id:
                     package_name_cache[cache_key] = package_name
                     return package_name
-
         package_names = []
         seen = set()
         for package_name, _ in android_streams:
             if package_name not in seen:
                 package_names.append(package_name)
                 seen.add(package_name)
-
         result = ", ".join(package_names)
         package_name_cache[cache_key] = result
         return result
-
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"PACKAGE NAME {status} for {app.app_name} / {app.property_id}: {error_text}")
@@ -458,12 +415,13 @@ def in_list_filter(field_name: str, values: list[str]) -> FilterExpression:
     return FilterExpression(
         filter=Filter(
             field_name=field_name,
-            in_list_filter=Filter.InListFilter(
-                values=values,
-                case_sensitive=False,
-            ),
+            in_list_filter=Filter.InListFilter(values=values, case_sensitive=False),
         )
     )
+
+
+def or_filter(expressions: list[FilterExpression]) -> FilterExpression:
+    return FilterExpression(or_group=FilterExpressionList(expressions=expressions))
 
 
 def and_filter(expressions: list[FilterExpression]) -> FilterExpression:
@@ -474,17 +432,18 @@ def date_order() -> OrderBy:
     return OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))
 
 
+def metric_order(metric_name: str, desc: bool = True) -> OrderBy:
+    return OrderBy(metric=OrderBy.MetricOrderBy(metric_name=metric_name), desc=desc)
+
+
 def row_to_dict(response_row, dimension_headers: list[str], metric_headers: list[str]) -> dict:
     data = {}
-
     for index, value in enumerate(response_row.dimension_values):
         if index < len(dimension_headers):
             data[dimension_headers[index]] = value.value
-
     for index, value in enumerate(response_row.metric_values):
         if index < len(metric_headers):
             data[metric_headers[index]] = value.value
-
     return data
 
 
@@ -514,39 +473,34 @@ def run_daily_metrics_report(app: AppConfig) -> dict[str, dict]:
         keep_empty_rows=True,
         limit=100000,
     )
-
     response = beta_client.run_report(request)
     by_date = {}
-
     for row in parse_response_rows(response):
         report_date = ga4_date_to_iso(row.get("date", ""))
         active_users = to_number(row.get("activeUsers", 0))
         sessions = to_number(row.get("sessions", 0))
         session_seconds = to_float(row.get("averageSessionDuration", 0))
         engagement_seconds = to_float(row.get("userEngagementDuration", 0))
-
         by_date[report_date] = {
             "Active Users": active_users,
             "New Users": to_number(row.get("newUsers", 0)),
             "Sessions": sessions,
             "Engaged Sessions": to_number(row.get("engagedSessions", 0)),
-            "Avg Session Duration Seconds": round(session_seconds, 2),
             "Avg Session Duration": format_seconds(session_seconds),
-            "Total Engagement Seconds": round(engagement_seconds, 2),
+            "Avg Session Duration Seconds": round(session_seconds, 2),
             "Total Engagement Time": format_seconds(engagement_seconds),
+            "Total Engagement Seconds": round(engagement_seconds, 2),
             "Sessions Per Active User": round(to_float(sessions) / to_float(active_users), 2) if to_float(active_users) else 0,
             "Engagement Rate": percent(row.get("engagementRate", 0)),
             "Total Event Count": to_number(row.get("eventCount", 0)),
             "Total Revenue": round(to_float(row.get("totalRevenue", 0)), 2),
         }
-
     return by_date
 
 
 def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, str], dict]:
     if not event_names:
         return {}
-
     request = RunReportRequest(
         property=f"properties/{app.property_id}",
         date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
@@ -557,10 +511,8 @@ def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, 
         keep_empty_rows=False,
         limit=100000,
     )
-
     response = beta_client.run_report(request)
     result = {}
-
     for row in parse_response_rows(response):
         report_date = ga4_date_to_iso(row.get("date", ""))
         event_name = row.get("eventName", "")
@@ -568,7 +520,6 @@ def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, 
             "active_users": to_number(row.get("activeUsers", 0)),
             "event_count": to_number(row.get("eventCount", 0)),
         }
-
     return result
 
 
@@ -578,32 +529,24 @@ def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
         date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
         dimensions=[Dimension(name="date")],
         metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-        dimension_filter=and_filter(
-            [
-                exact_filter("eventName", "screen_view"),
-                contains_filter(app.screen_field, app.home_screen_name),
-            ]
-        ),
+        dimension_filter=and_filter([exact_filter("eventName", "screen_view"), contains_filter(app.screen_field, app.home_screen_name)]),
         order_bys=[date_order()],
         keep_empty_rows=True,
         limit=100000,
     )
-
     response = beta_client.run_report(request)
     result = {}
-
     for row in parse_response_rows(response):
         report_date = ga4_date_to_iso(row.get("date", ""))
         result[report_date] = {
             "active_users": to_number(row.get("activeUsers", 0)),
             "event_count": to_number(row.get("eventCount", 0)),
         }
-
     return result
 
 
 def parse_cohort_day(value: str) -> int:
-    value = str(value).strip()
+    value = str(value or "").strip()
     if value == "":
         return 0
     try:
@@ -621,7 +564,6 @@ def chunked(values: list[str], size: int):
 def run_retention_report(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
     if config.retention_days <= 0:
         return {}
-
     retention_by_date = {
         report_date: {
             "Cohort Total Users": 0,
@@ -632,8 +574,6 @@ def run_retention_report(app: AppConfig, report_dates: list[str]) -> dict[str, d
         }
         for report_date in report_dates
     }
-
-    # GA4 limits very large cohort requests, so keep each API call compact.
     for dates_chunk in chunked(report_dates, 12):
         request = RunReportRequest(
             property=f"properties/{app.property_id}",
@@ -657,186 +597,718 @@ def run_retention_report(app: AppConfig, report_dates: list[str]) -> dict[str, d
             keep_empty_rows=True,
             limit=100000,
         )
-
         response = beta_client.run_report(request)
-
         for row in parse_response_rows(response):
             report_date = row.get("cohort", "")
             day = parse_cohort_day(row.get("cohortNthDay", "0"))
             active_users = to_number(row.get("cohortActiveUsers", 0))
             total_users = to_number(row.get("cohortTotalUsers", 0))
-
             if report_date not in retention_by_date:
                 continue
-
             if to_float(total_users) > to_float(retention_by_date[report_date]["Cohort Total Users"]):
                 retention_by_date[report_date]["Cohort Total Users"] = total_users
-
             if day == 1:
                 retention_by_date[report_date]["D1 Active Users"] = active_users
                 retention_by_date[report_date]["D1 Retention"] = rate(active_users, total_users)
             elif day == 7:
                 retention_by_date[report_date]["D7 Active Users"] = active_users
                 retention_by_date[report_date]["D7 Retention"] = rate(active_users, total_users)
-
     return retention_by_date
+
+
+def get_audience_segments():
+    paid_channel_groups = [
+        "Paid Search",
+        "Paid Social",
+        "Paid Video",
+        "Paid Shopping",
+        "Cross-network",
+        "Display",
+        "Paid Other",
+    ]
+    return [
+        ("All Users", None),
+        ("US Users", exact_filter("country", "United States")),
+        ("Direct Traffic", exact_filter("sessionDefaultChannelGroup", "Direct")),
+        ("Paid Traffic", or_filter([exact_filter("sessionDefaultChannelGroup", channel) for channel in paid_channel_groups])),
+        ("Mobile Traffic", exact_filter("deviceCategory", "mobile")),
+        ("Tablet Traffic", exact_filter("deviceCategory", "tablet")),
+    ]
+
+
+def run_segment_report(app: AppConfig, segment_name: str, segment_filter) -> dict[str, dict]:
+    request_params = {
+        "property": f"properties/{app.property_id}",
+        "date_ranges": [DateRange(start_date=config.start_date, end_date=config.end_date)],
+        "dimensions": [Dimension(name="date")],
+        "metrics": [
+            Metric(name="activeUsers"),
+            Metric(name="newUsers"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="engagementRate"),
+        ],
+        "order_bys": [date_order()],
+        "keep_empty_rows": True,
+        "limit": 100000,
+    }
+    if segment_filter is not None:
+        request_params["dimension_filter"] = segment_filter
+    response = beta_client.run_report(RunReportRequest(**request_params))
+    result = {}
+    for row in parse_response_rows(response):
+        report_date = ga4_date_to_iso(row.get("date", ""))
+        result[report_date] = {
+            "segment": segment_name,
+            "active": to_number(row.get("activeUsers", 0)),
+            "new": to_number(row.get("newUsers", 0)),
+            "sessions": to_number(row.get("sessions", 0)),
+            "engaged": to_number(row.get("engagedSessions", 0)),
+            "avg": format_seconds(row.get("averageSessionDuration", 0)),
+            "engagement": percent(row.get("engagementRate", 0)),
+        }
+    return result
+
+
+def run_all_audience_segments(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
+    by_date = {report_date: [] for report_date in report_dates}
+    for segment_name, segment_filter in get_audience_segments():
+        try:
+            data = run_segment_report(app, segment_name, segment_filter)
+            for report_date in report_dates:
+                row = data.get(report_date, {})
+                by_date[report_date].append(
+                    {
+                        "segment": segment_name,
+                        "active": row.get("active", 0),
+                        "sessions": row.get("sessions", 0),
+                        "engagement": row.get("engagement", "0%"),
+                    }
+                )
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(f"AUDIENCE {segment_name} {status} for {app.app_name}: {error_text}")
+            for report_date in report_dates:
+                by_date[report_date].append({"segment": segment_name, "active": "", "sessions": "", "engagement": status})
+    return by_date
+
+
+def get_personalized_ux_dimensions() -> list[tuple[str, str]]:
+    return [
+        ("Country", "country"),
+        ("Language", "language"),
+        ("Device Category", "deviceCategory"),
+        ("Operating System", "operatingSystem"),
+        ("App Version", "appVersion"),
+        ("First User Medium", "firstUserMedium"),
+        ("Top Screens / Screen Class", "unifiedPagePathScreen"),
+    ]
+
+
+def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str, report_dates: list[str]) -> dict[str, list[dict]]:
+    request = RunReportRequest(
+        property=f"properties/{app.property_id}",
+        date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+        dimensions=[Dimension(name="date"), Dimension(name=dimension_name)],
+        metrics=[
+            Metric(name="activeUsers"),
+            Metric(name="sessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="engagementRate"),
+        ],
+        order_bys=[date_order(), metric_order("activeUsers")],
+        limit=max(config.personalized_top_n * max(len(report_dates), 1) * 3, 100),
+    )
+    response = beta_client.run_report(request)
+    by_date = {report_date: [] for report_date in report_dates}
+    for row in parse_response_rows(response):
+        report_date = ga4_date_to_iso(row.get("date", ""))
+        value = row.get(dimension_name, "") or "(not set)"
+        if report_date in by_date and len(by_date[report_date]) < config.personalized_top_n:
+            by_date[report_date].append(
+                {
+                    "label": label,
+                    "value": value,
+                    "active": to_number(row.get("activeUsers", 0)),
+                    "sessions": to_number(row.get("sessions", 0)),
+                    "avg": format_seconds(row.get("averageSessionDuration", 0)),
+                    "engagement": percent(row.get("engagementRate", 0)),
+                }
+            )
+    return by_date
+
+
+def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
+    result = {report_date: [] for report_date in report_dates}
+    for label, dimension_name in get_personalized_ux_dimensions():
+        try:
+            by_date = run_dimension_session_report(app, label, dimension_name, report_dates)
+            for report_date, items in by_date.items():
+                if items:
+                    item_text = "; ".join(
+                        f"{item['value']} (Users {item['active']}, Sessions {item['sessions']}, ER {item['engagement']}, Avg {item['avg']})"
+                        for item in items[: config.personalized_top_n]
+                    )
+                    result[report_date].append(f"{label}: {item_text}")
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(f"PERSONALIZED UX {label} {status} for {app.app_name}: {error_text}")
+            for report_date in report_dates:
+                result[report_date].append(f"{label}: {status}")
+    return result
+
+
+def remote_config_event_filter() -> FilterExpression:
+    keywords = [
+        "remote_config",
+        "remote config",
+        "config",
+        "experiment",
+        "variant",
+        "feature_flag",
+        "featureflag",
+        "ab_test",
+        "abtest",
+        "firebase_exp",
+        "rc_",
+    ]
+    return or_filter([contains_filter("eventName", keyword) for keyword in keywords])
+
+
+def run_remote_config_events_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
+    result = {report_date: [] for report_date in report_dates}
+    try:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+            dimensions=[Dimension(name="date"), Dimension(name="eventName")],
+            metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
+            dimension_filter=remote_config_event_filter(),
+            order_bys=[date_order(), metric_order("eventCount")],
+            limit=config.remote_config_event_limit * max(len(report_dates), 1),
+        )
+        response = beta_client.run_report(request)
+        for row in parse_response_rows(response):
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            if report_date in result:
+                result[report_date].append(
+                    f"{row.get('eventName', '')}: Users {to_number(row.get('activeUsers', 0))}, Events {to_number(row.get('eventCount', 0))}"
+                )
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"REMOTE CONFIG EVENTS {status} for {app.app_name}: {error_text}")
+        for report_date in report_dates:
+            result[report_date].append(status)
+    return result
+
+
+def run_remote_config_app_versions(app: AppConfig, report_dates: list[str]) -> dict[str, list[str]]:
+    result = {report_date: [] for report_date in report_dates}
+    try:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+            dimensions=[Dimension(name="date"), Dimension(name="appVersion")],
+            metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="engagementRate")],
+            order_bys=[date_order(), metric_order("activeUsers")],
+            limit=max(config.remote_config_app_version_limit * max(len(report_dates), 1), 100),
+        )
+        response = beta_client.run_report(request)
+        for row in parse_response_rows(response):
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            if report_date in result and len(result[report_date]) < config.remote_config_app_version_limit:
+                result[report_date].append(
+                    f"App Version {row.get('appVersion', '(not set)')}: Users {to_number(row.get('activeUsers', 0))}, Sessions {to_number(row.get('sessions', 0))}, ER {percent(row.get('engagementRate', 0))}"
+                )
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"REMOTE CONFIG APP VERSION {status} for {app.app_name}: {error_text}")
+        for report_date in report_dates:
+            result[report_date].append(status)
+    return result
+
+
+def get_remote_config_session():
+    global remote_config_session
+    if remote_config_session is None:
+        remote_config_session = AuthorizedSession(credentials)
+    return remote_config_session
+
+
+def get_firebase_remote_config_template(firebase_project_id: str) -> dict:
+    project_id = str(firebase_project_id or "").strip()
+    if not project_id:
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
+    if project_id in remote_config_template_cache:
+        return remote_config_template_cache[project_id]
+    project_path = f"projects/{project_id}"
+    url = f"{config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
+    params = {}
+    namespace = str(config.remote_config_namespace or "").strip()
+    if namespace:
+        params["name"] = f"{project_path}/namespaces/{namespace}/remoteConfig"
+    response = get_remote_config_session().get(
+        url,
+        params=params,
+        headers={"Accept-Encoding": "gzip"},
+        timeout=config.firebase_remote_config_timeout,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Firebase Remote Config API error {response.status_code}: {response.text}")
+    template = response.json()
+    remote_config_template_cache[project_id] = template
+    return template
+
+
+def iter_remote_config_parameters(template: dict):
+    for key, parameter in (template.get("parameters", {}) or {}).items():
+        yield key, parameter, ""
+    for group_name, group_data in (template.get("parameterGroups", {}) or {}).items():
+        for key, parameter in (group_data.get("parameters", {}) or {}).items():
+            yield key, parameter, group_name
+
+
+def format_remote_config_value(value_object) -> str:
+    if value_object in [None, ""]:
+        return ""
+    if isinstance(value_object, dict):
+        if "value" in value_object:
+            return str(value_object.get("value", ""))
+        if value_object.get("useInAppDefault") is True:
+            return "Use in-app default"
+    return json.dumps(value_object, ensure_ascii=False, sort_keys=True)
+
+
+def get_parameter_values(parameter: dict) -> list[dict]:
+    values = []
+    if "defaultValue" in parameter:
+        values.append({"source": "Default", "condition": "", "value": format_remote_config_value(parameter.get("defaultValue"))})
+    for condition_name, value_object in (parameter.get("conditionalValues", {}) or {}).items():
+        values.append({"source": "Conditional", "condition": condition_name, "value": format_remote_config_value(value_object)})
+    return values
+
+
+def find_remote_config_parameter(template: dict, parameter_key: str) -> tuple[str, dict, str] | tuple[str, None, str]:
+    wanted = str(parameter_key or "").strip()
+    if not wanted:
+        return "", None, ""
+    wanted_lower = wanted.lower()
+    for key, parameter, group_name in iter_remote_config_parameters(template):
+        if key == wanted:
+            return key, parameter, group_name
+    for key, parameter, group_name in iter_remote_config_parameters(template):
+        key_lower = key.lower()
+        if wanted_lower in key_lower or key_lower in wanted_lower:
+            return key, parameter, group_name
+    return wanted, None, ""
+
+
+def extract_experiment_ids(value: str) -> str:
+    text = str(value or "")
+    ids = []
+    for pattern in [r"experiment[_-]?id['\"\s:=]+([A-Za-z0-9_.:-]+)", r"variant[_-]?id['\"\s:=]+([A-Za-z0-9_.:-]+)"]:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            ids.append(match.group(1))
+    return ", ".join(dict.fromkeys(ids))
+
+
+def summarize_parameter_values(parameter_key: str, parameter: dict, group_name: str = "") -> list[str]:
+    value_type = parameter.get("valueType", "") if parameter else ""
+    lines = []
+    for value_row in get_parameter_values(parameter or {}):
+        value = value_row["value"]
+        if value == "":
+            continue
+        condition = f" / {value_row['condition']}" if value_row.get("condition") else ""
+        group = f" / Group {group_name}" if group_name else ""
+        exp = extract_experiment_ids(value)
+        exp_text = f" / Experiment {exp}" if exp else ""
+        lines.append(f"{parameter_key}{group} | {value_row['source']}{condition} | {value_type} | {value}{exp_text}")
+    return lines
+
+
+def find_iap_parameters(template: dict, explicit_key: str) -> list[tuple[str, dict, str]]:
+    matches = []
+    seen = set()
+    if explicit_key:
+        key, parameter, group_name = find_remote_config_parameter(template, explicit_key)
+        if parameter is not None:
+            matches.append((key, parameter, group_name))
+            seen.add((group_name, key))
+    keywords = [k.lower() for k in split_csv(config.iap_screen_parameter_keywords)]
+    if explicit_key and explicit_key.lower() not in keywords:
+        keywords.insert(0, explicit_key.lower())
+    for key, parameter, group_name in iter_remote_config_parameters(template):
+        unique = (group_name, key)
+        if unique in seen:
+            continue
+        key_lower = key.lower()
+        if any(keyword and keyword in key_lower for keyword in keywords):
+            matches.append((key, parameter, group_name))
+            seen.add(unique)
+    return matches
+
+
+def get_notification_parameter_keys(app: AppConfig) -> list[str]:
+    return split_csv(app.daily_notification_parameters) or split_csv(config.notification_parameter_keywords)
+
+
+def is_notification_parameter_key(parameter_key: str, explicit_or_keywords: list[str]) -> bool:
+    key_lower = parameter_key.lower()
+    return any(item.lower() in key_lower for item in explicit_or_keywords if item)
+
+
+def try_json(value: str):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for candidate in [text, text.replace("'", '"')]:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def find_key_value_recursive(data, keys: list[str]) -> str:
+    if isinstance(data, dict):
+        for wanted in keys:
+            for key, value in data.items():
+                if wanted in str(key).lower():
+                    if isinstance(value, (str, int, float)):
+                        return str(value)
+                    return json.dumps(value, ensure_ascii=False)
+        for value in data.values():
+            found = find_key_value_recursive(value, keys)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = find_key_value_recursive(value, keys)
+            if found:
+                return found
+    return ""
+
+
+def extract_notification_details(raw_value: str) -> str:
+    text = str(raw_value or "")
+    parsed = try_json(text)
+    if parsed is not None:
+        title = find_key_value_recursive(parsed, ["title", "heading", "subject"])
+        body = find_key_value_recursive(parsed, ["body", "message", "content", "text"])
+        send_time = find_key_value_recursive(parsed, ["send_time", "sendtime", "time", "hour", "schedule"])
+        days = find_key_value_recursive(parsed, ["days", "repeat", "weekday"])
+        parts = []
+        if title:
+            parts.append(f"Title: {title}")
+        if body:
+            parts.append(f"Body: {body}")
+        if send_time:
+            parts.append(f"Time: {send_time}")
+        if days:
+            parts.append(f"Days: {days}")
+        if parts:
+            return ", ".join(parts)
+    title_match = re.search(r"(?:title|heading)\s*[:=]\s*([^|,;]+)", text, flags=re.IGNORECASE)
+    body_match = re.search(r"(?:body|message|content)\s*[:=]\s*([^|;]+)", text, flags=re.IGNORECASE)
+    time_match = re.search(r"(?:time|send_time|schedule)\s*[:=]\s*([0-9]{1,2}[:.]?[0-9]{0,2}\s*(?:am|pm)?|[^|,;]+)", text, flags=re.IGNORECASE)
+    parts = []
+    if title_match:
+        parts.append(f"Title: {title_match.group(1).strip()}")
+    if body_match:
+        parts.append(f"Body: {body_match.group(1).strip()}")
+    if time_match:
+        parts.append(f"Time: {time_match.group(1).strip()}")
+    return ", ".join(parts) if parts else text[:300]
+
+
+def summarize_daily_notifications_from_template(app: AppConfig, template: dict) -> str:
+    keys_or_keywords = get_notification_parameter_keys(app)
+    lines = []
+    for key, parameter, group_name in iter_remote_config_parameters(template):
+        if not is_notification_parameter_key(key, keys_or_keywords):
+            continue
+        for value_row in get_parameter_values(parameter):
+            value = value_row["value"]
+            if value == "":
+                continue
+            details = extract_notification_details(value)
+            condition = f" / {value_row['condition']}" if value_row.get("condition") else ""
+            group = f" / Group {group_name}" if group_name else ""
+            lines.append(f"{key}{group} | {value_row['source']}{condition} | {details}")
+    if not lines:
+        return "No daily notification Remote Config parameter found. Add exact keys in Apps Config column J."
+    return lines_to_cell(lines, 30)
+
+
+def get_remote_config_static_summaries(app: AppConfig) -> dict:
+    empty = {
+        "remote_config_static": "Missing Firebase Project ID in Apps Config.",
+        "time_capping": "Missing Firebase Project ID in Apps Config.",
+        "iap_screen": "Missing Firebase Project ID in Apps Config.",
+        "daily_notifications_static": "Missing Firebase Project ID in Apps Config.",
+    }
+    if not app.firebase_project_id:
+        return empty
+    try:
+        template = get_firebase_remote_config_template(app.firebase_project_id)
+        version = template.get("version", {}) or {}
+        version_number = version.get("versionNumber", "")
+        update_time = version.get("updateTime", "")
+        total_parameters = sum(1 for _ in iter_remote_config_parameters(template))
+
+        time_key = app.time_capping_parameter or config.time_capping_parameter
+        matched_time_key, time_param, time_group = find_remote_config_parameter(template, time_key)
+        if time_param is None:
+            time_capping = f"Parameter not found: {time_key}"
+        else:
+            time_capping = lines_to_cell(summarize_parameter_values(matched_time_key, time_param, time_group), 25)
+
+        iap_key = app.iap_screen_parameter or config.iap_screen_parameter
+        iap_matches = find_iap_parameters(template, iap_key)
+        if not iap_matches:
+            iap_screen = f"No IAP/paywall config found for {iap_key} or configured IAP keywords."
+        else:
+            lines = []
+            for key, parameter, group_name in iap_matches[:20]:
+                lines.extend(summarize_parameter_values(key, parameter, group_name))
+            iap_screen = lines_to_cell(lines, 40)
+
+        daily_notifications = summarize_daily_notifications_from_template(app, template)
+        remote_config_static = lines_to_cell(
+            [
+                f"Template Version: {version_number}" if version_number else "Template Version: blank",
+                f"Last Published At: {update_time}" if update_time else "Last Published At: blank",
+                f"Total Parameters: {total_parameters}",
+            ]
+        )
+        return {
+            "remote_config_static": remote_config_static,
+            "time_capping": time_capping,
+            "iap_screen": iap_screen,
+            "daily_notifications_static": daily_notifications,
+        }
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FIREBASE REMOTE CONFIG {status} for {app.app_name}: {error_text}")
+        message = f"{status}: {error_text}"
+        return {
+            "remote_config_static": message,
+            "time_capping": message,
+            "iap_screen": message,
+            "daily_notifications_static": message,
+        }
+
+
+def build_session_retention_cell(metrics: dict, retention: dict) -> str:
+    return lines_to_cell(
+        [
+            f"Active Users: {metrics.get('Active Users', 0)}",
+            f"New Users: {metrics.get('New Users', 0)}",
+            f"Sessions: {metrics.get('Sessions', 0)}",
+            f"Engaged Sessions: {metrics.get('Engaged Sessions', 0)}",
+            f"Engagement Rate: {metrics.get('Engagement Rate', '0%')}",
+            f"Avg Session Duration: {metrics.get('Avg Session Duration', '0m 0s')}",
+            f"Sessions Per Active User: {metrics.get('Sessions Per Active User', 0)}",
+            f"Total Engagement Time: {metrics.get('Total Engagement Time', '0m 0s')}",
+            f"Cohort Total Users: {retention.get('Cohort Total Users', 0)}",
+            f"D1 Active Users: {retention.get('D1 Active Users', 0)}",
+            f"D1 Retention: {retention.get('D1 Retention', '0%')}",
+            f"D7 Active Users: {retention.get('D7 Active Users', 0)}",
+            f"D7 Retention: {retention.get('D7 Retention', '0%')}",
+        ]
+    )
+
+
+def build_basic_funnel_cell(report_date: str, app: AppConfig, event_data: dict, home_data: dict, key_events: list[str]) -> str:
+    first_open_users = event_data.get((report_date, "first_open"), {}).get("active_users", 0)
+    home_users = home_data.get(report_date, {}).get("active_users", 0)
+    home_views = home_data.get(report_date, {}).get("event_count", 0)
+    drop_off = max(int(to_float(first_open_users) - to_float(home_users)), 0)
+    lines = [
+        f"First Open Users: {first_open_users}",
+        f"Home Screen Users: {home_users}",
+        f"Home Screen Views: {home_views}",
+        f"Drop Off: {drop_off}",
+        f"Conversion Rate: {rate(home_users, first_open_users)}",
+        f"Home Screen Match: {app.screen_field} contains {app.home_screen_name}",
+    ]
+    for event_name in key_events:
+        data = event_data.get((report_date, event_name), {})
+        count = data.get("event_count", 0)
+        users = data.get("active_users", 0)
+        if count or users:
+            lines.append(f"{event_name}: Events {count}, Users {users}")
+    return lines_to_cell(lines)
+
+
+def build_audience_cell(segments: list[dict]) -> str:
+    return lines_to_cell(
+        [f"{item['segment']}: Users {item.get('active', 0)}, Sessions {item.get('sessions', 0)}, ER {item.get('engagement', '0%')}" for item in segments]
+    )
+
+
+def build_remote_config_cell(dynamic_events: list[str], app_versions: list[str], static_summary: str) -> str:
+    lines = []
+    if static_summary:
+        lines.append(static_summary)
+    if dynamic_events:
+        lines.append("GA4 Config Events:")
+        lines.extend(dynamic_events)
+    if app_versions:
+        lines.append("App Version Impact:")
+        lines.extend(app_versions[:10])
+    return lines_to_cell(lines, 60)
+
+
+def build_daily_notifications_cell(static_notifications: str, event_data: dict, report_date: str, notification_events: list[str]) -> str:
+    lines = []
+    if static_notifications:
+        lines.append("Configured Daily Notifications:")
+        lines.extend(static_notifications.split("\n"))
+    event_lines = []
+    for event_name in notification_events:
+        data = event_data.get((report_date, event_name), {})
+        count = data.get("event_count", 0)
+        users = data.get("active_users", 0)
+        if count or users:
+            event_lines.append(f"{event_name}: Events {count}, Users {users}")
+    if event_lines:
+        lines.append("GA4 Notification Events:")
+        lines.extend(event_lines)
+    return lines_to_cell(lines, 60)
 
 
 def remove_empty_and_duplicate_columns(rows: list[list]) -> list[list]:
     if not rows or not rows[0]:
         return rows
-
     header = [str(value).strip() for value in rows[0]]
     protected = {"Package Name", "Date"}
     keep_indexes = []
     seen_signatures: dict[tuple[str, ...], str] = {}
-
     for index, column_name in enumerate(header):
         values = tuple(str(row[index]).strip() if index < len(row) else "" for row in rows[1:])
-
         if column_name in protected:
             keep_indexes.append(index)
             continue
-
         if all(value == "" for value in values):
+            print(f"Removed empty column: {column_name}")
             continue
-
         if values in seen_signatures:
             print(f"Removed duplicate-data column: {column_name} = {seen_signatures[values]}")
             continue
-
         seen_signatures[values] = column_name
         keep_indexes.append(index)
-
     return [[row[index] if index < len(row) else "" for index in keep_indexes] for row in rows]
 
 
-def build_header(event_names: list[str]) -> list[str]:
-    header = [
-        "Package Name",
-        "Date",
-        "Active Users",
-        "New Users",
-        "Sessions",
-        "Engaged Sessions",
-        "Avg Session Duration Seconds",
-        "Avg Session Duration",
-        "Total Engagement Seconds",
-        "Total Engagement Time",
-        "Sessions Per Active User",
-        "Engagement Rate",
-        "Total Event Count",
-        "Total Revenue",
-        "First Open Users",
-        "Home Screen Users",
-        "Home Screen Views",
-        "Funnel Drop Off",
-        "Funnel Conversion Rate",
-        "Cohort Total Users",
-        "D1 Active Users",
-        "D1 Retention",
-        "D7 Active Users",
-        "D7 Retention",
-    ]
-
-    for event_name in event_names:
-        if event_name == "first_open":
-            continue
-        header.append(f"{event_name} Event Count")
-
-    return header
-
-
-def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str, event_names: list[str]) -> list[list]:
+def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
     print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
+    notification_events = split_csv(config.notification_event_names)
+    key_events = split_csv(config.key_event_names)
+    event_names = split_csv(",".join(["first_open"] + notification_events + key_events))
 
     daily_metrics = {}
     event_data = {}
     home_data = {}
     retention_data = {}
+    audience_segments = {report_date: [] for report_date in report_dates}
+    personalized_ux = {report_date: [] for report_date in report_dates}
+    remote_events = {report_date: [] for report_date in report_dates}
+    remote_versions = {report_date: [] for report_date in report_dates}
+    static_remote = get_remote_config_static_summaries(app)
 
     try:
         daily_metrics = run_daily_metrics_report(app)
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"DAILY METRICS {status} for {app.app_name}: {error_text}")
-
     try:
         event_data = run_event_report(app, event_names)
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"EVENTS {status} for {app.app_name}: {error_text}")
-
     try:
         home_data = run_home_screen_report(app)
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"HOME SCREEN {status} for {app.app_name}: {error_text}")
-
     try:
         retention_data = run_retention_report(app, report_dates)
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"RETENTION {status} for {app.app_name}: {error_text}")
+    try:
+        audience_segments = run_all_audience_segments(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"AUDIENCE SEGMENTS {status} for {app.app_name}: {error_text}")
+    try:
+        personalized_ux = run_personalized_ux(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"PERSONALIZED UX {status} for {app.app_name}: {error_text}")
+    try:
+        remote_events = run_remote_config_events_report(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"REMOTE CONFIG EVENTS {status} for {app.app_name}: {error_text}")
+    try:
+        remote_versions = run_remote_config_app_versions(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"REMOTE CONFIG APP VERSIONS {status} for {app.app_name}: {error_text}")
 
     rows = []
-
     for report_date in report_dates:
         metrics = daily_metrics.get(report_date, {})
-        first_open_users = event_data.get((report_date, "first_open"), {}).get("active_users", 0)
-        home_users = home_data.get(report_date, {}).get("active_users", 0)
-        home_views = home_data.get(report_date, {}).get("event_count", 0)
-        drop_off = to_float(first_open_users) - to_float(home_users)
-        if drop_off < 0:
-            drop_off = 0
-
-        row_values = {
-            "Package Name": package_name,
-            "Date": report_date,
-            "Active Users": metrics.get("Active Users", 0),
-            "New Users": metrics.get("New Users", 0),
-            "Sessions": metrics.get("Sessions", 0),
-            "Engaged Sessions": metrics.get("Engaged Sessions", 0),
-            "Avg Session Duration Seconds": metrics.get("Avg Session Duration Seconds", 0),
-            "Avg Session Duration": metrics.get("Avg Session Duration", "0m 0s"),
-            "Total Engagement Seconds": metrics.get("Total Engagement Seconds", 0),
-            "Total Engagement Time": metrics.get("Total Engagement Time", "0m 0s"),
-            "Sessions Per Active User": metrics.get("Sessions Per Active User", 0),
-            "Engagement Rate": metrics.get("Engagement Rate", "0%"),
-            "Total Event Count": metrics.get("Total Event Count", 0),
-            "Total Revenue": metrics.get("Total Revenue", 0),
-            "First Open Users": first_open_users,
-            "Home Screen Users": home_users,
-            "Home Screen Views": home_views,
-            "Funnel Drop Off": int(drop_off),
-            "Funnel Conversion Rate": rate(home_users, first_open_users),
-        }
-        row_values.update(retention_data.get(report_date, {}))
-
-        for event_name in event_names:
-            if event_name == "first_open":
-                continue
-            row_values[f"{event_name} Event Count"] = event_data.get((report_date, event_name), {}).get("event_count", 0)
-
-        rows.append(row_values)
-
-    header = build_header(event_names)
-    return [[row.get(column, "") for column in header] for row in rows]
+        retention = retention_data.get(report_date, {})
+        rows.append(
+            [
+                package_name,
+                report_date,
+                build_daily_notifications_cell(
+                    static_remote.get("daily_notifications_static", ""),
+                    event_data,
+                    report_date,
+                    notification_events,
+                ),
+                build_audience_cell(audience_segments.get(report_date, [])),
+                build_basic_funnel_cell(report_date, app, event_data, home_data, key_events),
+                build_remote_config_cell(
+                    remote_events.get(report_date, []),
+                    remote_versions.get(report_date, []),
+                    static_remote.get("remote_config_static", ""),
+                ),
+                static_remote.get("time_capping", ""),
+                static_remote.get("iap_screen", ""),
+                build_session_retention_cell(metrics, retention),
+                lines_to_cell(personalized_ux.get(report_date, []), 80),
+            ]
+        )
+    return rows
 
 
 def main():
     print("Reading app list from Apps Config sheet...")
     apps = read_apps_config()
     report_dates = get_report_dates()
-
     print(f"Total enabled apps found: {len(apps)}")
     print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
 
-    notification_events = split_csv(config.notification_event_names)
-    key_events = split_csv(config.key_event_names)
-    event_names = split_csv(",".join(["first_open"] + notification_events + key_events))
-
-    header = build_header(event_names)
+    header = [
+        "Package Name",
+        "Date",
+        "Daily Notifications",
+        "Audience Segments",
+        "Basic Funnel Analysis",
+        "Remote Configuration",
+        "A/B Test on Time Capping",
+        "A/B Test on IAPs Screen",
+        "Retention and Session Time Analysis",
+        "Personalized User Experience",
+    ]
     rows = [header]
 
     for app in apps:
@@ -845,20 +1317,19 @@ def main():
             print(f"Package name found for {app.app_name}: {package_name}")
         else:
             print(f"Package name not found for {app.app_name}; final Package Name cell will be blank.")
-
-        rows.extend(build_rows_for_app(app, report_dates, package_name, event_names))
+        rows.extend(build_rows_for_app(app, report_dates, package_name))
 
     rows = remove_empty_and_duplicate_columns(rows)
     write_sheet(config.merged_sheet, rows)
 
-    print("Done. Only the merged report was updated.")
+    date_chunks = (len(report_dates) + 11) // 12
+    approx_ga4_calls_per_app = 1 + 1 + 1 + date_chunks + 6 + 7 + 1 + 1
+    print("Done. Only GA4 Merged Data was updated.")
     print(f"Merged Sheet: {config.merged_sheet}")
     print(f"Rows written: {len(rows) - 1}")
-    print(
-        "Expected GA4 Data API calls: "
-        f"about {len(apps) * (3 + ((len(report_dates) + 11) // 12))} "
-        "instead of apps × dates × reports."
-    )
+    print(f"Approx GA4 Data API calls per app: {approx_ga4_calls_per_app}")
+    print("Firebase Remote Config calls: about 1 per unique Firebase Project ID, cached and reused for Time Capping, IAP Screen, Daily Notifications, and Remote Configuration.")
+    print("No separate report sheets are created or written.")
 
 
 if __name__ == "__main__":
