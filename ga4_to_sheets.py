@@ -1,6 +1,6 @@
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -319,7 +319,29 @@ def get_report_date_range_display() -> str:
     start = resolve_ga4_date(config.start_date)
     end = resolve_ga4_date(config.end_date)
 
+    if start == end:
+        return start
+
     return f"{start} to {end}"
+
+
+def get_report_dates() -> list[str]:
+    start = datetime.fromisoformat(
+        resolve_ga4_date(config.start_date)
+    ).date()
+    end = datetime.fromisoformat(
+        resolve_ga4_date(config.end_date)
+    ).date()
+
+    if start > end:
+        raise ValueError(
+            f"START_DATE must be on or before END_DATE. Current range: {start} to {end}"
+        )
+
+    return [
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    ]
 
 
 def get_retention_cohort_date_range() -> tuple[str, str]:
@@ -3856,7 +3878,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Date Range",
+            "Date",
             "First Open Users",
             "Home Users",
             "Drop Off",
@@ -3874,7 +3896,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Date Range",
+            "Date",
             "Funnel Step",
             "Event Name",
             "Screen Condition",
@@ -3892,7 +3914,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Active Users",
             "New Users",
             "Sessions",
@@ -3919,7 +3941,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Retention Cohort Date Range",
             "Cohort Name",
             "Retention Day",
@@ -3937,7 +3959,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Audience Segment",
             "Segment Rule",
             "Active Users",
@@ -3960,7 +3982,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Personalization Breakdown",
             "GA4 Dimension",
             "Dimension Value",
@@ -3985,7 +4007,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Remote Config Area",
             "Rule / Type",
             "Value",
@@ -4007,7 +4029,7 @@ def main():
             "Firebase Project ID",
             "Firebase Project Name",
             "Firebase App ID",
-            "Report Date Range",
+            "Date",
             "Remote Config Parameter",
             "Parameter Group",
             "Value Source",
@@ -4034,7 +4056,7 @@ def main():
             "Firebase Project ID",
             "Firebase Project Name",
             "Firebase App ID",
-            "Report Date Range",
+            "Date",
             "Remote Config Parameter",
             "Parameter Group",
             "Value Source",
@@ -4061,7 +4083,7 @@ def main():
             "Firebase Project ID",
             "Firebase Project Name",
             "Firebase App ID",
-            "Report Date Range",
+            "Date",
             "Source",
             "Remote Config Parameter(s)",
             "Parameter Group",
@@ -4092,7 +4114,7 @@ def main():
         [
             "App Name",
             "Property ID",
-            "Report Date Range",
+            "Date",
             "Notification Event",
             "GA4 Date Hour Minute",
             "Active Users",
@@ -4110,7 +4132,7 @@ def main():
             "Firebase Project ID",
             "Firebase Project Name",
             "Firebase App ID",
-            "Report Date Range",
+            "Date",
             "FCM Date",
             "Analytics Label",
             "Messages Accepted",
@@ -4134,317 +4156,259 @@ def main():
         ]
     ]
 
-    report_date_range = get_report_date_range_display()
+    base_config = config
+    report_dates = get_report_dates()
+    full_report_date_range = (
+        f"{report_dates[0]} to {report_dates[-1]}"
+        if report_dates
+        else get_report_date_range_display()
+    )
 
     for app in apps:
-        print(f"Processing: {app.app_name} / {app.property_id}")
-
-        # Funnel
-        try:
-            funnel_response = run_first_open_to_home_funnel(app)
-            funnel_summary_row, app_funnel_details = parse_funnel_rows(
-                app,
-                funnel_response,
+        for report_date in report_dates:
+            config = replace(
+                base_config,
+                start_date=report_date,
+                end_date=report_date,
             )
+            report_date_range = get_report_date_range_display()
+            print(f"Processing: {app.app_name} / {app.property_id} / {report_date}")
 
-            funnel_summary_rows.append(funnel_summary_row)
-            funnel_details_rows.extend(app_funnel_details)
+            # Funnel
+            try:
+                funnel_response = run_first_open_to_home_funnel(app)
+                funnel_summary_row, app_funnel_details = parse_funnel_rows(
+                    app,
+                    funnel_response,
+                )
 
-        except Exception as error:
-            status, error_text = classify_api_error(error)
+                funnel_summary_rows.append(funnel_summary_row)
+                funnel_details_rows.extend(app_funnel_details)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+                updated_at = now_text()
+
+                print(f"FUNNEL {status} for {app.app_name}: {error_text}")
+
+                funnel_summary_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        app.home_screen_name,
+                        app.screen_field,
+                        status,
+                        error_text,
+                        updated_at,
+                    ]
+                )
+
+                funnel_details_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        updated_at,
+                    ]
+                )
+
+            # User/session + retention
+            session_data = empty_session_data()
+            retention_summary = empty_retention_summary()
+            errors = []
+            status_priority = []
+
+            try:
+                session_response = run_user_session_report(app)
+                session_data = parse_user_session_report(session_response)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+                errors.append(f"Session {status}: {error_text}")
+                status_priority.append(status)
+                print(f"SESSION {status} for {app.app_name}: {error_text}")
+
+            try:
+                retention_response = run_retention_report(app)
+                retention_summary, app_retention_details = parse_retention_report(
+                    app,
+                    retention_response,
+                )
+
+                retention_details_rows.extend(app_retention_details)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+                errors.append(f"Retention {status}: {error_text}")
+                status_priority.append(status)
+                print(f"RETENTION {status} for {app.app_name}: {error_text}")
+
+                append_error_retention_detail(
+                    retention_details_rows=retention_details_rows,
+                    app=app,
+                    report_date_range=report_date_range,
+                    retention_summary=retention_summary,
+                    status=status,
+                    error_text=error_text,
+                )
+
+            if not errors:
+                user_session_status = "SUCCESS"
+                user_session_error = ""
+            elif "NO ACCESS" in status_priority:
+                user_session_status = "NO ACCESS"
+                user_session_error = " | ".join(errors)
+            elif "INVALID PROPERTY ID" in status_priority:
+                user_session_status = "INVALID PROPERTY ID"
+                user_session_error = " | ".join(errors)
+            else:
+                user_session_status = "ERROR"
+                user_session_error = " | ".join(errors)
+
             updated_at = now_text()
 
-            print(f"FUNNEL {status} for {app.app_name}: {error_text}")
-
-            funnel_summary_rows.append(
+            user_session_rows.append(
                 [
                     app.app_name,
                     app.property_id,
                     report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    app.home_screen_name,
-                    app.screen_field,
-                    status,
-                    error_text,
+                    session_data["active_users"],
+                    session_data["new_users"],
+                    session_data["sessions"],
+                    session_data["engaged_sessions"],
+                    session_data["average_session_duration_seconds"],
+                    session_data["average_session_duration"],
+                    session_data["total_engagement_seconds"],
+                    session_data["total_engagement_time"],
+                    session_data["sessions_per_active_user"],
+                    session_data["engagement_rate"],
+                    retention_summary["cohort_date_range"],
+                    retention_summary["cohort_total_users"],
+                    retention_summary["d1_active_users"],
+                    retention_summary["d1_retention"],
+                    retention_summary["d7_active_users"],
+                    retention_summary["d7_retention"],
+                    user_session_status,
+                    user_session_error,
                     updated_at,
                 ]
             )
 
-            funnel_details_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    updated_at,
-                ]
-            )
+            # Audience segments
+            try:
+                app_audience_rows = build_audience_segment_rows_for_app(app)
+                audience_segment_rows.extend(app_audience_rows)
 
-        # User/session + retention
-        session_data = empty_session_data()
-        retention_summary = empty_retention_summary()
-        errors = []
-        status_priority = []
+            except Exception as error:
+                status, error_text = classify_api_error(error)
 
-        try:
-            session_response = run_user_session_report(app)
-            session_data = parse_user_session_report(session_response)
+                audience_segment_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
+                )
 
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            errors.append(f"Session {status}: {error_text}")
-            status_priority.append(status)
-            print(f"SESSION {status} for {app.app_name}: {error_text}")
+            # Personalized user experience
+            try:
+                app_personalized_rows = build_personalized_ux_rows_for_app(app)
+                personalized_ux_rows.extend(app_personalized_rows)
 
-        try:
-            retention_response = run_retention_report(app)
-            retention_summary, app_retention_details = parse_retention_report(
-                app,
-                retention_response,
-            )
+            except Exception as error:
+                status, error_text = classify_api_error(error)
 
-            retention_details_rows.extend(app_retention_details)
+                personalized_ux_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
+                )
 
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            errors.append(f"Retention {status}: {error_text}")
-            status_priority.append(status)
-            print(f"RETENTION {status} for {app.app_name}: {error_text}")
+            # Remote configuration
+            try:
+                app_remote_config_rows = build_remote_config_rows_for_app(app)
+                remote_config_rows.extend(app_remote_config_rows)
 
-            append_error_retention_detail(
-                retention_details_rows=retention_details_rows,
-                app=app,
-                report_date_range=report_date_range,
-                retention_summary=retention_summary,
-                status=status,
-                error_text=error_text,
-            )
+            except Exception as error:
+                status, error_text = classify_api_error(error)
 
-        if not errors:
-            user_session_status = "SUCCESS"
-            user_session_error = ""
-        elif "NO ACCESS" in status_priority:
-            user_session_status = "NO ACCESS"
-            user_session_error = " | ".join(errors)
-        elif "INVALID PROPERTY ID" in status_priority:
-            user_session_status = "INVALID PROPERTY ID"
-            user_session_error = " | ".join(errors)
-        else:
-            user_session_status = "ERROR"
-            user_session_error = " | ".join(errors)
+                remote_config_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
+                )
 
-        updated_at = now_text()
+            # Firebase A/B test on time capping from Remote Config
+            try:
+                app_time_capping_rows = build_time_capping_ab_rows_for_app(app)
+                time_capping_ab_rows.extend(app_time_capping_rows)
 
-        user_session_rows.append(
-            [
-                app.app_name,
-                app.property_id,
-                report_date_range,
-                session_data["active_users"],
-                session_data["new_users"],
-                session_data["sessions"],
-                session_data["engaged_sessions"],
-                session_data["average_session_duration_seconds"],
-                session_data["average_session_duration"],
-                session_data["total_engagement_seconds"],
-                session_data["total_engagement_time"],
-                session_data["sessions_per_active_user"],
-                session_data["engagement_rate"],
-                retention_summary["cohort_date_range"],
-                retention_summary["cohort_total_users"],
-                retention_summary["d1_active_users"],
-                retention_summary["d1_retention"],
-                retention_summary["d7_active_users"],
-                retention_summary["d7_retention"],
-                user_session_status,
-                user_session_error,
-                updated_at,
-            ]
-        )
+            except Exception as error:
+                status, error_text = classify_api_error(error)
 
-        # Audience segments
-        try:
-            app_audience_rows = build_audience_segment_rows_for_app(app)
-            audience_segment_rows.extend(app_audience_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            audience_segment_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # Personalized user experience
-        try:
-            app_personalized_rows = build_personalized_ux_rows_for_app(app)
-            personalized_ux_rows.extend(app_personalized_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            personalized_ux_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # Remote configuration
-        try:
-            app_remote_config_rows = build_remote_config_rows_for_app(app)
-            remote_config_rows.extend(app_remote_config_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            remote_config_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # Firebase A/B test on time capping from Remote Config
-        try:
-            app_time_capping_rows = build_time_capping_ab_rows_for_app(app)
-            time_capping_ab_rows.extend(app_time_capping_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            time_capping_ab_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    app.firebase_project_id,
-                    app.firebase_project_name,
-                    app.firebase_app_id,
-                    report_date_range,
-                    app.time_capping_parameter,
-                    "",
-                    "A/B Test on Time Capping",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # Firebase A/B test on IAP/paywall screen from Remote Config
-        try:
-            app_iap_screen_rows = build_iap_screen_ab_rows_for_app(app)
-            iap_screen_ab_rows.extend(app_iap_screen_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            iap_screen_ab_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    app.firebase_project_id,
-                    app.firebase_project_name,
-                    app.firebase_app_id,
-                    report_date_range,
-                    app.iap_screen_parameter,
-                    "",
-                    "A/B Test on IAPs Screen",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # Firebase daily notifications from Remote Config
-        try:
-            app_daily_notification_rows = build_daily_notification_rows_for_app(app)
-            daily_notifications_rows.extend(app_daily_notification_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            daily_notifications_rows.append(
-                make_daily_notification_empty_row(
+                time_capping_ab_rows.append(
                     [
                         app.app_name,
                         app.property_id,
@@ -4452,46 +4416,34 @@ def main():
                         app.firebase_project_name,
                         app.firebase_app_id,
                         report_date_range,
-                    ],
-                    status,
-                    error_text,
-                    now_text(),
+                        app.time_capping_parameter,
+                        "",
+                        "A/B Test on Time Capping",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
                 )
-            )
 
-        # GA4 notification receive/open/dismiss events
-        try:
-            app_ga4_notification_rows = build_ga4_notification_event_rows_for_app(app)
-            ga4_notification_event_rows.extend(app_ga4_notification_rows)
+            # Firebase A/B test on IAP/paywall screen from Remote Config
+            try:
+                app_iap_screen_rows = build_iap_screen_ab_rows_for_app(app)
+                iap_screen_ab_rows.extend(app_iap_screen_rows)
 
-        except Exception as error:
-            status, error_text = classify_api_error(error)
+            except Exception as error:
+                status, error_text = classify_api_error(error)
 
-            ga4_notification_event_rows.append(
-                [
-                    app.app_name,
-                    app.property_id,
-                    report_date_range,
-                    "",
-                    "",
-                    "",
-                    "",
-                    status,
-                    error_text,
-                    now_text(),
-                ]
-            )
-
-        # FCM aggregate delivery data
-        try:
-            app_fcm_delivery_rows = build_fcm_delivery_rows_for_app(app)
-            fcm_delivery_rows.extend(app_fcm_delivery_rows)
-
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-
-            fcm_delivery_rows.append(
-                make_fcm_delivery_empty_row(
+                iap_screen_ab_rows.append(
                     [
                         app.app_name,
                         app.property_id,
@@ -4499,12 +4451,97 @@ def main():
                         app.firebase_project_name,
                         app.firebase_app_id,
                         report_date_range,
-                    ],
-                    status,
-                    error_text,
-                    now_text(),
+                        app.iap_screen_parameter,
+                        "",
+                        "A/B Test on IAPs Screen",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
                 )
-            )
+
+            # Firebase daily notifications from Remote Config
+            try:
+                app_daily_notification_rows = build_daily_notification_rows_for_app(app)
+                daily_notifications_rows.extend(app_daily_notification_rows)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+
+                daily_notifications_rows.append(
+                    make_daily_notification_empty_row(
+                        [
+                            app.app_name,
+                            app.property_id,
+                            app.firebase_project_id,
+                            app.firebase_project_name,
+                            app.firebase_app_id,
+                            report_date_range,
+                        ],
+                        status,
+                        error_text,
+                        now_text(),
+                    )
+                )
+
+            # GA4 notification receive/open/dismiss events
+            try:
+                app_ga4_notification_rows = build_ga4_notification_event_rows_for_app(app)
+                ga4_notification_event_rows.extend(app_ga4_notification_rows)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+
+                ga4_notification_event_rows.append(
+                    [
+                        app.app_name,
+                        app.property_id,
+                        report_date_range,
+                        "",
+                        "",
+                        "",
+                        "",
+                        status,
+                        error_text,
+                        now_text(),
+                    ]
+                )
+
+            # FCM aggregate delivery data
+            try:
+                app_fcm_delivery_rows = build_fcm_delivery_rows_for_app(app)
+                fcm_delivery_rows.extend(app_fcm_delivery_rows)
+
+            except Exception as error:
+                status, error_text = classify_api_error(error)
+
+                fcm_delivery_rows.append(
+                    make_fcm_delivery_empty_row(
+                        [
+                            app.app_name,
+                            app.property_id,
+                            app.firebase_project_id,
+                            app.firebase_project_name,
+                            app.firebase_app_id,
+                            report_date_range,
+                        ],
+                        status,
+                        error_text,
+                        now_text(),
+                    )
+                )
+
+    config = base_config
 
     write_report_sheet(config.summary_sheet, funnel_summary_rows, package_name_lookup)
     write_report_sheet(config.details_sheet, funnel_details_rows, package_name_lookup)
@@ -4532,7 +4569,7 @@ def main():
     print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
     print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
     print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
-    print(f"Report Date Range: {report_date_range}")
+    print(f"Report Date Range: {full_report_date_range}")
 
 
 if __name__ == "__main__":
