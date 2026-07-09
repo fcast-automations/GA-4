@@ -618,6 +618,231 @@ def write_report_sheet(
     )
 
 
+
+def is_merge_excluded_column(header_name: str) -> bool:
+    """Return True for columns that should not be repeated in merged output."""
+    normalized = str(header_name).strip().lower()
+
+    if normalized in {
+        "app name",
+        "package name",
+        "property id",
+        "date",
+        "date range",
+        "status",
+        "error",
+        "updated at",
+        "recommendation",
+        "recommendation / error",
+        "home screen name",
+        "screen field",
+        "remote config parameter",
+        "remote config parameter(s)",
+        "retention cohort date range",
+        "firebase project id",
+        "firebase project name",
+        "firebase app id",
+    }:
+        return True
+
+    if "source" in normalized:
+        return True
+
+    return False
+
+
+def get_cell_by_header(row: list, header: list[str], header_name: str) -> str:
+    if header_name not in header:
+        return ""
+
+    index = header.index(header_name)
+
+    if index >= len(row):
+        return ""
+
+    return str(row[index]).strip()
+
+
+def set_first_non_empty(target: dict, field_name: str, value: str):
+    value = str(value).strip()
+
+    if value and not target.get(field_name):
+        target[field_name] = value
+
+
+def compact_sheet_row_summary(header: list[str], row: list) -> str:
+    parts = []
+
+    for index, column_name in enumerate(header):
+        if is_merge_excluded_column(column_name):
+            continue
+
+        value = ""
+        if index < len(row):
+            value = str(row[index]).strip()
+
+        if value:
+            parts.append(f"{column_name}: {value}")
+
+    return "; ".join(parts)
+
+
+def build_merged_report_rows(
+    report_sheets: list[tuple[str, list[list]]],
+    package_name_lookup: dict[str, str],
+    apps: list[AppConfig],
+) -> list[list]:
+    """
+    Build a clean merged sheet with one row per Package Name + Date.
+
+    The merged sheet keeps repeated app/project/Firebase identifiers once, then creates
+    one column for each included report sheet. Sheet cells contain compact summaries of
+    the useful metrics from that source sheet while excluding status/error/source and
+    repeated configuration columns.
+    """
+    excluded_sheet_names = {
+        config.details_sheet,
+        config.daily_notifications_sheet,
+    }
+
+    included_sheet_names = [
+        sheet_name
+        for sheet_name, _ in report_sheets
+        if sheet_name not in excluded_sheet_names
+    ]
+
+    app_metadata_by_property = {}
+    app_metadata_by_package = {}
+
+    for app in apps:
+        app_name_key = str(app.app_name).strip()
+        property_id_key = str(app.property_id).strip()
+        package_name = package_name_lookup.get(
+            f"{app_name_key}|{property_id_key}",
+            package_name_lookup.get(property_id_key, ""),
+        )
+        metadata = {
+            "App Name": app_name_key,
+            "Package Name": package_name,
+            "Property ID": property_id_key,
+            "Firebase Project ID": str(app.firebase_project_id).strip(),
+            "Firebase Project Name": str(app.firebase_project_name).strip(),
+            "Firebase App ID": str(app.firebase_app_id).strip(),
+        }
+
+        if property_id_key:
+            app_metadata_by_property[property_id_key] = metadata
+
+        if package_name:
+            app_metadata_by_package[package_name] = metadata
+
+    merged_rows_by_key = {}
+
+    for sheet_name, rows in report_sheets:
+        if sheet_name in excluded_sheet_names or not rows:
+            continue
+
+        sheet_rows = add_package_name_column(rows, package_name_lookup)
+        header = [str(value).strip() for value in sheet_rows[0]]
+
+        for row in sheet_rows[1:]:
+            app_name = get_cell_by_header(row, header, "App Name")
+            package_name = get_cell_by_header(row, header, "Package Name")
+            property_id = get_cell_by_header(row, header, "Property ID")
+            firebase_project_id = get_cell_by_header(row, header, "Firebase Project ID")
+            firebase_project_name = get_cell_by_header(row, header, "Firebase Project Name")
+            firebase_app_id = get_cell_by_header(row, header, "Firebase App ID")
+            report_date = get_cell_by_header(row, header, "Date")
+
+            if not report_date:
+                continue
+
+            app_metadata = (
+                app_metadata_by_property.get(property_id)
+                or app_metadata_by_package.get(package_name)
+                or {}
+            )
+
+            app_name = app_name or app_metadata.get("App Name", "")
+            package_name = package_name or app_metadata.get("Package Name", "")
+            property_id = property_id or app_metadata.get("Property ID", "")
+            firebase_project_id = firebase_project_id or app_metadata.get("Firebase Project ID", "")
+            firebase_project_name = firebase_project_name or app_metadata.get("Firebase Project Name", "")
+            firebase_app_id = firebase_app_id or app_metadata.get("Firebase App ID", "")
+
+            # Package Name is the primary key. If the GA4 Admin lookup cannot return
+            # a package name, use Property ID internally so different apps do not merge
+            # into one blank-package row.
+            key_package = package_name or f"PROPERTY_ID:{property_id}"
+            key = (key_package, report_date)
+
+            if key not in merged_rows_by_key:
+                merged_rows_by_key[key] = {
+                    "App Name": "",
+                    "Package Name": package_name,
+                    "Property ID": "",
+                    "Firebase Project ID": "",
+                    "Firebase Project Name": "",
+                    "Firebase App ID": "",
+                    "Date": report_date,
+                    "_sheet_values": {name: [] for name in included_sheet_names},
+                }
+
+            merged = merged_rows_by_key[key]
+            set_first_non_empty(merged, "App Name", app_name)
+            set_first_non_empty(merged, "Property ID", property_id)
+            set_first_non_empty(merged, "Firebase Project ID", firebase_project_id)
+            set_first_non_empty(merged, "Firebase Project Name", firebase_project_name)
+            set_first_non_empty(merged, "Firebase App ID", firebase_app_id)
+
+            if package_name and not merged.get("Package Name"):
+                merged["Package Name"] = package_name
+
+            row_summary = compact_sheet_row_summary(header, row)
+
+            if row_summary:
+                merged["_sheet_values"].setdefault(sheet_name, []).append(row_summary)
+
+    output_header = [
+        "Package Name",
+        "Date",
+        "App Name",
+        "Property ID",
+        "Firebase Project ID",
+        "Firebase Project Name",
+        "Firebase App ID",
+    ] + included_sheet_names
+
+    output_rows = [output_header]
+
+    for key in sorted(
+        merged_rows_by_key,
+        key=lambda item: (
+            merged_rows_by_key[item].get("App Name", ""),
+            merged_rows_by_key[item].get("Package Name", ""),
+            merged_rows_by_key[item].get("Date", ""),
+        ),
+    ):
+        merged = merged_rows_by_key[key]
+        row = [
+            merged.get("Package Name", ""),
+            merged.get("Date", ""),
+            merged.get("App Name", ""),
+            merged.get("Property ID", ""),
+            merged.get("Firebase Project ID", ""),
+            merged.get("Firebase Project Name", ""),
+            merged.get("Firebase App ID", ""),
+        ]
+
+        for sheet_name in included_sheet_names:
+            sheet_values = merged.get("_sheet_values", {}).get(sheet_name, [])
+            row.append(" | ".join(sheet_values))
+
+        output_rows.append(row)
+
+    return output_rows
+
+
 # =========================
 # FUNNEL REPORT
 # =========================
@@ -3850,6 +4075,7 @@ def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
 
 def main():
     global config
+
     print("Reading app list from Apps Config sheet...")
 
     apps = read_apps_config()
@@ -4544,6 +4770,21 @@ def main():
 
     config = base_config
 
+    report_sheets = [
+        (config.summary_sheet, funnel_summary_rows),
+        (config.details_sheet, funnel_details_rows),
+        (config.user_session_sheet, user_session_rows),
+        (config.retention_details_sheet, retention_details_rows),
+        (config.audience_segments_sheet, audience_segment_rows),
+        (config.personalized_ux_sheet, personalized_ux_rows),
+        (config.remote_config_sheet, remote_config_rows),
+        (config.time_capping_ab_sheet, time_capping_ab_rows),
+        (config.iap_screen_ab_sheet, iap_screen_ab_rows),
+        (config.daily_notifications_sheet, daily_notifications_rows),
+        (config.ga4_notification_events_sheet, ga4_notification_event_rows),
+        (config.fcm_delivery_sheet, fcm_delivery_rows),
+    ]
+
     write_report_sheet(config.summary_sheet, funnel_summary_rows, package_name_lookup)
     write_report_sheet(config.details_sheet, funnel_details_rows, package_name_lookup)
     write_report_sheet(config.user_session_sheet, user_session_rows, package_name_lookup)
@@ -4556,6 +4797,10 @@ def main():
     write_report_sheet(config.daily_notifications_sheet, daily_notifications_rows, package_name_lookup)
     write_report_sheet(config.ga4_notification_events_sheet, ga4_notification_event_rows, package_name_lookup)
     write_report_sheet(config.fcm_delivery_sheet, fcm_delivery_rows, package_name_lookup)
+    write_sheet(
+        config.merged_sheet,
+        build_merged_report_rows(report_sheets, package_name_lookup, apps),
+    )
 
     print("Done. All reports updated in Google Sheet.")
     print(f"Funnel Summary: {config.summary_sheet}")
@@ -4570,6 +4815,7 @@ def main():
     print(f"Firebase Daily Notifications: {config.daily_notifications_sheet}")
     print(f"GA4 Notification Events: {config.ga4_notification_events_sheet}")
     print(f"Firebase Notification Delivery: {config.fcm_delivery_sheet}")
+    print(f"Merged Data: {config.merged_sheet}")
     print(f"Report Date Range: {full_report_date_range}")
 
 
