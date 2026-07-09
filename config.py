@@ -55,7 +55,6 @@ class Config:
     daily_notifications_sheet: str
     ga4_notification_events_sheet: str
     fcm_delivery_sheet: str
-    bigquery_export_sheet: str
 
     start_date: str
     end_date: str
@@ -132,10 +131,6 @@ def load_config() -> Config:
         fcm_delivery_sheet=optional_env(
             "FCM_DELIVERY_SHEET",
             "Firebase Notification Delivery",
-        ),
-        bigquery_export_sheet=optional_env(
-            "BIGQUERY_EXPORT_SHEET",
-            "BigQuery Unified Export",
         ),
 
         start_date=optional_env("START_DATE", "28daysAgo"),
