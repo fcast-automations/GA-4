@@ -3849,6 +3849,7 @@ def build_fcm_delivery_rows_for_app(app: AppConfig) -> list[list]:
 
 
 def main():
+    global config
     print("Reading app list from Apps Config sheet...")
 
     apps = read_apps_config()
