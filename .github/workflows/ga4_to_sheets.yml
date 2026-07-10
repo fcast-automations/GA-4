@@ -2,9 +2,6 @@ name: GA4 to Google Sheets
 
 on:
   workflow_dispatch
-
-  
-
 jobs:
   ga4-to-sheets:
     runs-on: ubuntu-latest
@@ -46,7 +43,7 @@ jobs:
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
           REMOTE_CONFIG_EVENT_LIMIT: ${{ vars.REMOTE_CONFIG_EVENT_LIMIT || '25' }}
-          REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '10' }}
+          REMOTE_CONFIG_APP_VERSION_LIMIT: ${{ vars.REMOTE_CONFIG_APP_VERSION_LIMIT || '0' }}
 
           TIME_CAPPING_PARAMETER: ${{ vars.TIME_CAPPING_PARAMETER || 'ad_time_capping' }}
           IAP_SCREEN_PARAMETER: ${{ vars.IAP_SCREEN_PARAMETER || 'iap_screen' }}
