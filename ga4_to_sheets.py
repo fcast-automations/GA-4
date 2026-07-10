@@ -41,6 +41,9 @@ class AppConfig:
     time_capping_parameter: str
     daily_notification_parameters: str
     iap_screen_parameter: str
+    app_open_event_names: str
+    home_event_names: str
+    feature_event_names: str
 
 
 def get_credentials():
@@ -160,6 +163,9 @@ def get_apps_config_headers() -> list[str]:
         "Time Capping Parameter",
         "Daily Notification Parameters",
         "IAP Screen Parameter",
+        "App Open Event Names",
+        "Home Event Names",
+        "Feature Event Names",
     ]
 
 
@@ -170,7 +176,7 @@ def ensure_apps_config_headers(service, values: list[list]):
         return
     service.spreadsheets().values().update(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A1:K1",
+        range=f"{config.apps_config_sheet}!A1",
         valueInputOption="USER_ENTERED",
         body={"values": [expected_headers]},
     ).execute()
@@ -191,7 +197,7 @@ def read_apps_config() -> list[AppConfig]:
     ensure_sheet_exists(service, config.apps_config_sheet)
     response = service.spreadsheets().values().get(
         spreadsheetId=config.spreadsheet_id,
-        range=f"{config.apps_config_sheet}!A:K",
+        range=f"{config.apps_config_sheet}!A:N",
     ).execute()
     values = response.get("values", [])
     if len(values) <= 1:
@@ -221,6 +227,9 @@ def read_apps_config() -> list[AppConfig]:
                 time_capping_parameter=(row[8].strip() if len(row) > 8 else ""),
                 daily_notification_parameters=(row[9].strip() if len(row) > 9 else ""),
                 iap_screen_parameter=(row[10].strip() if len(row) > 10 else ""),
+                app_open_event_names=(row[11].strip() if len(row) > 11 and row[11].strip() else config.app_open_event_names),
+                home_event_names=(row[12].strip() if len(row) > 12 else ""),
+                feature_event_names=(row[13].strip() if len(row) > 13 and row[13].strip() else config.feature_event_names),
             )
         )
     if not apps:
@@ -1362,6 +1371,39 @@ def build_fcm_delivery_by_date(app: AppConfig, report_dates: list[str]) -> dict[
         return {report_date: message for report_date in report_dates}
 
 
+def get_event_metric(event_data: dict, report_date: str, event_name: str) -> dict:
+    return event_data.get((report_date, event_name), {}) or {}
+
+
+def pick_first_available_event(event_data: dict, report_date: str, event_names: list[str]) -> tuple[str, dict]:
+    for event_name in event_names:
+        data = get_event_metric(event_data, report_date, event_name)
+        if to_float(data.get("active_users", 0)) or to_float(data.get("event_count", 0)):
+            return event_name, data
+    if event_names:
+        return event_names[0], get_event_metric(event_data, report_date, event_names[0])
+    return "", {}
+
+
+def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict, home_data: dict) -> tuple[str, int, int, str]:
+    home_event_names = split_csv(app.home_event_names)
+    if home_event_names:
+        home_event, home_event_data = pick_first_available_event(event_data, report_date, home_event_names)
+        return (
+            home_event,
+            to_number(home_event_data.get("active_users", 0)),
+            to_number(home_event_data.get("event_count", 0)),
+            f"eventName = {home_event}",
+        )
+
+    screen_data = home_data.get(report_date, {})
+    return (
+        "screen_view",
+        to_number(screen_data.get("active_users", 0)),
+        to_number(screen_data.get("event_count", 0)),
+        f"eventName = screen_view AND {app.screen_field} contains {app.home_screen_name}",
+    )
+
 def build_session_retention_cell(metrics: dict, retention: dict) -> str:
     return lines_to_cell(
         [
@@ -1382,26 +1424,42 @@ def build_session_retention_cell(metrics: dict, retention: dict) -> str:
     )
 
 
-def build_basic_funnel_cell(report_date: str, app: AppConfig, event_data: dict, home_data: dict, key_events: list[str]) -> str:
-    first_open_users = event_data.get((report_date, "first_open"), {}).get("active_users", 0)
-    home_users = home_data.get(report_date, {}).get("active_users", 0)
-    home_views = home_data.get(report_date, {}).get("event_count", 0)
-    drop_off = max(int(to_float(first_open_users) - to_float(home_users)), 0)
+def build_basic_funnel_cell(report_date: str, app: AppConfig, event_data: dict, home_data: dict, feature_events: list[str]) -> str:
+    app_open_events = split_csv(app.app_open_event_names)
+    app_open_event, app_open_data = pick_first_available_event(event_data, report_date, app_open_events)
+    app_open_users = to_number(app_open_data.get("active_users", 0))
+    app_open_count = to_number(app_open_data.get("event_count", 0))
+
+    home_event, home_users, home_views, home_match = get_home_metrics_for_date(report_date, app, event_data, home_data)
+    possible_drop_off = max(int(to_float(app_open_users) - to_float(home_users)), 0)
+
     lines = [
-        f"First Open Users: {first_open_users}",
-        f"Home Screen Users: {home_users}",
-        f"Home Screen Views: {home_views}",
-        f"Drop Off: {drop_off}",
-        f"Conversion Rate: {rate(home_users, first_open_users)}",
-        f"Home Screen Match: {app.screen_field} contains {app.home_screen_name}",
+        f"App Open Event: {app_open_event or 'not configured'}",
+        f"App Open Users: {app_open_users}",
+        f"App Open Events: {app_open_count}",
+        f"Home Event/Screen: {home_event or 'not configured'}",
+        f"Home Users: {home_users}",
+        f"Home Events / Views: {home_views}",
+        f"Possible Drop Off: {possible_drop_off}",
+        f"Home Reach Rate: {rate(home_users, app_open_users)}",
+        f"Home Match: {home_match}",
     ]
-    for event_name in key_events:
-        data = event_data.get((report_date, event_name), {})
+
+    feature_lines = []
+    for event_name in feature_events:
+        if event_name in app_open_events or event_name in split_csv(app.home_event_names):
+            continue
+        data = get_event_metric(event_data, report_date, event_name)
         count = data.get("event_count", 0)
         users = data.get("active_users", 0)
         if count or users:
-            lines.append(f"{event_name}: Events {count}, Users {users}")
-    return lines_to_cell(lines)
+            feature_lines.append(f"{event_name}: Events {count}, Users {users}")
+    if feature_lines:
+        lines.append("Feature Events:")
+        lines.extend(feature_lines)
+    else:
+        lines.append("Feature Events: No configured feature events found for this date")
+    return lines_to_cell(lines, 80)
 
 
 def build_audience_cell(segments: list[dict]) -> str:
@@ -1467,8 +1525,10 @@ def remove_empty_and_duplicate_columns(rows: list[list]) -> list[list]:
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
     print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
     notification_events = split_csv(config.notification_event_names)
-    key_events = split_csv(config.key_event_names)
-    event_names = split_csv(",".join(["first_open"] + notification_events + key_events))
+    feature_events = split_csv(app.feature_event_names)
+    app_open_events = split_csv(app.app_open_event_names)
+    home_event_names = split_csv(app.home_event_names)
+    event_names = split_csv(",".join(notification_events + feature_events + app_open_events + home_event_names))
 
     daily_metrics = {}
     event_data = {}
@@ -1491,11 +1551,12 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"EVENTS {status} for {app.app_name}: {error_text}")
-    try:
-        home_data = run_home_screen_report(app)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"HOME SCREEN {status} for {app.app_name}: {error_text}")
+    if not split_csv(app.home_event_names):
+        try:
+            home_data = run_home_screen_report(app)
+        except Exception as error:
+            status, error_text = classify_api_error(error)
+            print(f"HOME SCREEN {status} for {app.app_name}: {error_text}")
     try:
         retention_data = run_retention_report(app, report_dates)
     except Exception as error:
@@ -1543,7 +1604,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
                 ),
                 fcm_delivery.get(report_date, ""),
                 build_audience_cell(audience_segments.get(report_date, [])),
-                build_basic_funnel_cell(report_date, app, event_data, home_data, key_events),
+                build_basic_funnel_cell(report_date, app, event_data, home_data, feature_events),
                 build_remote_config_cell(
                     remote_events.get(report_date, []),
                     remote_versions.get(report_date, []),
@@ -1592,7 +1653,9 @@ def main():
     write_sheet(config.merged_sheet, rows)
 
     date_chunks = (len(report_dates) + 11) // 12
-    approx_ga4_calls_per_app = 1 + 1 + 1 + date_chunks + 6 + 7 + 1 + 1
+    approx_ga4_calls_per_app = 1 + 1 + date_chunks + 6 + 7 + 1 + 1
+    if any(not split_csv(app.home_event_names) for app in apps):
+        approx_ga4_calls_per_app += 1
     print("Done. Only GA4 Merged Data was updated.")
     print(f"Merged Sheet: {config.merged_sheet}")
     print(f"Rows written: {len(rows) - 1}")
