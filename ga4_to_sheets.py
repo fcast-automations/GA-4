@@ -761,35 +761,64 @@ def get_personalized_ux_dimensions() -> list[tuple[str, str]]:
 
 
 def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str, report_dates: list[str]) -> dict[str, list[dict]]:
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-        dimensions=[Dimension(name="date"), Dimension(name=dimension_name)],
-        metrics=[
-            Metric(name="activeUsers"),
-            Metric(name="sessions"),
-            Metric(name="averageSessionDuration"),
-            Metric(name="engagementRate"),
-        ],
-        order_bys=[date_order(), metric_order("activeUsers")],
-        limit=max(config.personalized_top_n * max(len(report_dates), 1) * 3, 100),
-    )
-    response = beta_client.run_report(request)
+    """Return the top dimension values independently for every report date.
+
+    The old implementation used one small global API limit. Because results are
+    ordered by date, high-cardinality dimensions such as country and language
+    used the entire limit on the first dates, making later dates look trimmed.
+
+    This version reads the result in large pages. Normally it is still one API
+    call; extra calls occur only when the response contains more than one page.
+    """
     by_date = {report_date: [] for report_date in report_dates}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        value = row.get(dimension_name, "") or "(not set)"
-        if report_date in by_date and len(by_date[report_date]) < config.personalized_top_n:
-            by_date[report_date].append(
-                {
-                    "label": label,
-                    "value": value,
-                    "active": to_number(row.get("activeUsers", 0)),
-                    "sessions": to_number(row.get("sessions", 0)),
-                    "avg": format_seconds(row.get("averageSessionDuration", 0)),
-                    "engagement": percent(row.get("engagementRate", 0)),
-                }
-            )
+    page_size = 100000
+    offset = 0
+
+    while True:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+            dimensions=[Dimension(name="date"), Dimension(name=dimension_name)],
+            metrics=[
+                Metric(name="activeUsers"),
+                Metric(name="sessions"),
+                Metric(name="averageSessionDuration"),
+                Metric(name="engagementRate"),
+            ],
+            order_bys=[date_order(), metric_order("activeUsers")],
+            limit=page_size,
+            offset=offset,
+        )
+        response = beta_client.run_report(request)
+        page_rows = parse_response_rows(response)
+
+        if not page_rows:
+            break
+
+        for row in page_rows:
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            value = row.get(dimension_name, "") or "(not set)"
+            if report_date in by_date and len(by_date[report_date]) < config.personalized_top_n:
+                by_date[report_date].append(
+                    {
+                        "label": label,
+                        "value": value,
+                        "active": to_number(row.get("activeUsers", 0)),
+                        "sessions": to_number(row.get("sessions", 0)),
+                        "avg": format_seconds(row.get("averageSessionDuration", 0)),
+                        "engagement": percent(row.get("engagementRate", 0)),
+                    }
+                )
+
+        offset += len(page_rows)
+        total_rows = int(getattr(response, "row_count", 0) or 0)
+        if len(page_rows) < page_size or (total_rows and offset >= total_rows):
+            break
+
+    missing_dates = [date for date, items in by_date.items() if not items]
+    if missing_dates:
+        print(f"PERSONALIZED UX {label}: no returned rows for dates {missing_dates}")
+
     return by_date
 
 
