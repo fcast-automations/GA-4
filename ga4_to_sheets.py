@@ -258,7 +258,23 @@ def get_report_dates() -> list[str]:
     if start > end:
         raise ValueError(f"START_DATE must be on or before END_DATE. Current: {start} to {end}")
     return [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+def is_retention_day_ready(report_date: str, day: int, data_lag_days: int = 1) -> bool:
+    """
+    Returns True only when the retention day should have complete GA4 data.
 
+    Example:
+    report_date = 2026-07-03
+    D7 date = 2026-07-10
+
+    With data_lag_days=1, D7 is considered ready from 2026-07-11 onward.
+    This avoids showing fake 0% when GA4 data is still processing.
+    """
+    cohort_date = datetime.fromisoformat(report_date).date()
+    retention_date = cohort_date + timedelta(days=day)
+
+    latest_complete_date = datetime.now(ZoneInfo(config.timezone)).date() - timedelta(days=data_lag_days)
+
+    return retention_date <= latest_complete_date
 
 def ga4_date_to_iso(value: str) -> str:
     value = str(value or "").strip()
@@ -577,16 +593,82 @@ def chunked(values: list[str], size: int):
 def run_retention_report(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
     if config.retention_days <= 0:
         return {}
-    retention_by_date = {
-        report_date: {
+
+    retention_by_date = {}
+
+    for report_date in report_dates:
+        d1_ready = is_retention_day_ready(report_date, 1)
+        d7_ready = is_retention_day_ready(report_date, 7)
+
+        retention_by_date[report_date] = {
             "Cohort Total Users": 0,
-            "D1 Active Users": 0,
-            "D1 Retention": "0%",
-            "D7 Active Users": 0,
-            "D7 Retention": "0%",
+
+            "D1 Active Users": 0 if d1_ready else "Not available yet",
+            "D1 Retention": "0%" if d1_ready else "Not available yet",
+
+            "D7 Active Users": 0 if d7_ready else "Not available yet",
+            "D7 Retention": "0%" if d7_ready else "Not available yet",
         }
-        for report_date in report_dates
-    }
+
+    for dates_chunk in chunked(report_dates, 12):
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            dimensions=[
+                Dimension(name="cohort"),
+                Dimension(name="cohortNthDay"),
+            ],
+            metrics=[
+                Metric(name="cohortActiveUsers"),
+                Metric(name="cohortTotalUsers"),
+            ],
+            cohort_spec=CohortSpec(
+                cohorts=[
+                    Cohort(
+                        name=report_date,
+                        dimension="firstSessionDate",
+                        date_range=DateRange(
+                            start_date=report_date,
+                            end_date=report_date,
+                        ),
+                    )
+                    for report_date in dates_chunk
+                ],
+                cohorts_range=CohortsRange(
+                    granularity=CohortsRange.Granularity.DAILY,
+                    start_offset=0,
+                    end_offset=config.retention_days,
+                ),
+            ),
+            keep_empty_rows=True,
+            limit=100000,
+        )
+
+        response = beta_client.run_report(request)
+
+        for row in parse_response_rows(response):
+            report_date = row.get("cohort", "")
+            day = parse_cohort_day(row.get("cohortNthDay", "0"))
+
+            active_users = to_number(row.get("cohortActiveUsers", 0))
+            total_users = to_number(row.get("cohortTotalUsers", 0))
+
+            if report_date not in retention_by_date:
+                continue
+
+            if to_float(total_users) > to_float(retention_by_date[report_date]["Cohort Total Users"]):
+                retention_by_date[report_date]["Cohort Total Users"] = total_users
+
+            if day == 1:
+                if is_retention_day_ready(report_date, 1):
+                    retention_by_date[report_date]["D1 Active Users"] = active_users
+                    retention_by_date[report_date]["D1 Retention"] = rate(active_users, total_users)
+
+            elif day == 7:
+                if is_retention_day_ready(report_date, 7):
+                    retention_by_date[report_date]["D7 Active Users"] = active_users
+                    retention_by_date[report_date]["D7 Retention"] = rate(active_users, total_users)
+
+    return retention_by_date
     for dates_chunk in chunked(report_dates, 12):
         request = RunReportRequest(
             property=f"properties/{app.property_id}",
