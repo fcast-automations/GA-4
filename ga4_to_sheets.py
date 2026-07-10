@@ -1593,6 +1593,76 @@ def remove_empty_and_duplicate_columns(rows: list[list]) -> list[list]:
     return [[row[index] if index < len(row) else "" for index in keep_indexes] for row in rows]
 
 
+REPORT_HEADERS = [
+    "Daily Notifications",
+    "Firebase Notification Delivery",
+    "Audience Segments",
+    "Basic Funnel Analysis",
+    "Remote Configuration",
+    "A/B Test on Time Capping",
+    "A/B Test on IAPs Screen",
+    "First-Session Retention and Session Time Analysis",
+    "Personalized User Experience",
+]
+
+
+def split_report_cell_items(cell_value: str, split_grouped_values: bool = False) -> list[str]:
+    """Expand a multi-line report cell into individual row values.
+
+    The sheet columns remain unchanged. Package Name and Date are repeated on
+    every expanded row. For grouped Personalized User Experience lines such as
+    ``Country: Ukraine (...); Uzbekistan (...)``, each value becomes its own
+    row while retaining the dimension label.
+    """
+    text = str(cell_value or "").strip()
+    if not text:
+        return []
+
+    items: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if split_grouped_values and ": " in line:
+            label, grouped_text = line.split(": ", 1)
+            grouped_items = [part.strip() for part in grouped_text.split("; ") if part.strip()]
+            if len(grouped_items) > 1:
+                items.extend(f"{label}: {part}" for part in grouped_items)
+                continue
+
+        items.append(line)
+    return items
+
+
+def expand_report_columns(package_name: str, report_date: str, cells: list[str]) -> list[list]:
+    """Write each section item on a separate row without changing headers.
+
+    Items are aligned vertically by their position inside each existing report
+    column. No Section/Category/Item columns are introduced.
+    """
+    expanded_columns: list[list[str]] = []
+    for header, cell in zip(REPORT_HEADERS, cells):
+        expanded_columns.append(
+            split_report_cell_items(
+                cell,
+                split_grouped_values=(header == "Personalized User Experience"),
+            )
+        )
+
+    row_count = max((len(values) for values in expanded_columns), default=0)
+    if row_count == 0:
+        row_count = 1
+
+    rows: list[list] = []
+    for row_index in range(row_count):
+        row = [package_name, report_date]
+        for values in expanded_columns:
+            row.append(values[row_index] if row_index < len(values) else "")
+        rows.append(row)
+    return rows
+
+
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
     print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
     notification_events = split_csv(config.notification_event_names)
@@ -1622,7 +1692,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"EVENTS {status} for {app.app_name}: {error_text}")
-    if not split_csv(app.home_event_names):
+    if not home_event_names:
         try:
             home_data = run_home_screen_report(app)
         except Exception as error:
@@ -1659,36 +1729,32 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
         status, error_text = classify_api_error(error)
         print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
 
-    rows = []
+    rows: list[list] = []
     for report_date in report_dates:
         metrics = daily_metrics.get(report_date, {})
         retention = retention_data.get(report_date, {})
-        rows.append(
-            [
-                package_name,
+        report_cells = [
+            build_daily_notifications_cell(
+                static_remote.get("daily_notifications_static", ""),
+                event_data,
                 report_date,
-                build_daily_notifications_cell(
-                    static_remote.get("daily_notifications_static", ""),
-                    event_data,
-                    report_date,
-                    notification_events,
-                ),
-                fcm_delivery.get(report_date, ""),
-                build_audience_cell(audience_segments.get(report_date, [])),
-                build_basic_funnel_cell(report_date, app, event_data, home_data, feature_events),
-                build_remote_config_cell(
-                    remote_events.get(report_date, []),
-                    remote_versions.get(report_date, []),
-                    static_remote.get("remote_config_static", ""),
-                ),
-                static_remote.get("time_capping", ""),
-                static_remote.get("iap_screen", ""),
-                build_session_retention_cell(metrics, retention),
-                lines_to_cell(personalized_ux.get(report_date, []), 80),
-            ]
-        )
+                notification_events,
+            ),
+            fcm_delivery.get(report_date, ""),
+            build_audience_cell(audience_segments.get(report_date, [])),
+            build_basic_funnel_cell(report_date, app, event_data, home_data, feature_events),
+            build_remote_config_cell(
+                remote_events.get(report_date, []),
+                remote_versions.get(report_date, []),
+                static_remote.get("remote_config_static", ""),
+            ),
+            static_remote.get("time_capping", ""),
+            static_remote.get("iap_screen", ""),
+            build_session_retention_cell(metrics, retention),
+            lines_to_cell(personalized_ux.get(report_date, []), 80),
+        ]
+        rows.extend(expand_report_columns(package_name, report_date, report_cells))
     return rows
-
 
 def main():
     print("Reading app list from Apps Config sheet...")
@@ -1697,19 +1763,7 @@ def main():
     print(f"Total enabled apps found: {len(apps)}")
     print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
 
-    header = [
-        "Package Name",
-        "Date",
-        "Daily Notifications",
-        "Firebase Notification Delivery",
-        "Audience Segments",
-        "Basic Funnel Analysis",
-        "Remote Configuration",
-        "A/B Test on Time Capping",
-        "A/B Test on IAPs Screen",
-        "First-Session Retention and Session Time Analysis",
-        "Personalized User Experience",
-    ]
+    header = ["Package Name", "Date", *REPORT_HEADERS]
     rows = [header]
 
     for app in apps:
@@ -1720,7 +1774,7 @@ def main():
             print(f"Package name not found for {app.app_name}; final Package Name cell will be blank.")
         rows.extend(build_rows_for_app(app, report_dates, package_name))
 
-    rows = remove_empty_and_duplicate_columns(rows)
+    # Keep the original report columns exactly as defined above.
     write_sheet(config.merged_sheet, rows)
 
     date_chunks = (len(report_dates) + 11) // 12
@@ -1729,7 +1783,7 @@ def main():
         approx_ga4_calls_per_app += 1
     print("Done. Only GA4 Merged Data was updated.")
     print(f"Merged Sheet: {config.merged_sheet}")
-    print(f"Rows written: {len(rows) - 1}")
+    print(f"Expanded rows written: {len(rows) - 1}")
     print(f"Approx GA4 Data API calls per app: {approx_ga4_calls_per_app}")
     print("Firebase Remote Config calls: about 1 per unique Firebase Project ID, cached and reused for Time Capping, IAP Screen, Daily Notifications, and Remote Configuration.")
     print("FCM Data API calls: about 1 per unique Firebase Android App ID, cached and written inside GA4 Merged Data.")
