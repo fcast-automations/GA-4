@@ -9,6 +9,9 @@ from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
+    Cohort,
+    CohortSpec,
+    CohortsRange,
     DateRange,
     Dimension,
     Filter,
@@ -17,18 +20,6 @@ from google.analytics.data_v1beta.types import (
     Metric,
     OrderBy,
     RunReportRequest,
-)
-from google.analytics.data_v1alpha import AlphaAnalyticsDataClient
-from google.analytics.data_v1alpha.types import (
-    DateRange as AlphaDateRange,
-    Funnel,
-    FunnelEventFilter,
-    FunnelFieldFilter,
-    FunnelFilterExpression,
-    FunnelFilterExpressionList,
-    FunnelStep,
-    RunFunnelReportRequest,
-    StringFilter as AlphaStringFilter,
 )
 from googleapiclient.discovery import build
 
@@ -62,7 +53,6 @@ def get_credentials():
 
 credentials = get_credentials()
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
-alpha_client = AlphaAnalyticsDataClient(credentials=credentials)
 analytics_admin_session = None
 remote_config_session = None
 notification_api_session = None
@@ -583,178 +573,100 @@ def is_retention_target_ready(
     return target_day <= latest_complete_day
 
 
-def run_first_open_cohort_totals(
-    app: AppConfig,
-    report_dates: list[str],
-) -> dict[str, int | float]:
-    """Return Day-0 cohort users using the same first_open event as GA4 UI."""
-    if not report_dates:
-        return {}
-
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[
-            DateRange(
-                start_date=min(report_dates),
-                end_date=max(report_dates),
-            )
-        ],
-        dimensions=[Dimension(name="date")],
-        metrics=[Metric(name="activeUsers")],
-        dimension_filter=exact_filter("eventName", "first_open"),
-        order_bys=[date_order()],
-        keep_empty_rows=True,
-        limit=100000,
-    )
-    response = beta_client.run_report(request)
-
-    totals = {report_date: 0 for report_date in report_dates}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        if report_date in totals:
-            totals[report_date] = to_number(row.get("activeUsers", 0))
-    return totals
+def chunked(values: list[str], size: int):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
 
 
-def alpha_exact_date_filter(report_date: str) -> FunnelFilterExpression:
-    """Create a funnel filter for the GA4 YYYYMMDD date dimension."""
-    return FunnelFilterExpression(
-        funnel_field_filter=FunnelFieldFilter(
-            field_name="date",
-            string_filter=AlphaStringFilter(
-                match_type=AlphaStringFilter.MatchType.EXACT,
-                value=report_date.replace("-", ""),
-                case_sensitive=False,
-            ),
-        )
-    )
-
-
-def first_open_on_date_filter(report_date: str) -> FunnelFilterExpression:
-    """Match users whose first_open event occurred on the cohort date."""
-    return FunnelFilterExpression(
-        and_group=FunnelFilterExpressionList(
-            expressions=[
-                FunnelFilterExpression(
-                    funnel_event_filter=FunnelEventFilter(event_name="first_open")
-                ),
-                alpha_exact_date_filter(report_date),
-            ]
-        )
-    )
-
-
-def get_funnel_step_active_users(response, step_number: int) -> int | float:
-    """Extract active users for one numbered funnel step."""
-    report = response.funnel_table
-    dimension_names = [header.name for header in report.dimension_headers]
-    metric_names = [header.name for header in report.metric_headers]
-
-    for row in report.rows:
-        dimensions = {
-            dimension_names[index]: value.value
-            for index, value in enumerate(row.dimension_values)
-        }
-        metrics = {
-            metric_names[index]: value.value
-            for index, value in enumerate(row.metric_values)
-        }
-        if dimensions.get("funnelStepName", "").startswith(f"{step_number}."):
-            return to_number(metrics.get("activeUsers", 0))
-    return 0
-
-
-def run_first_open_return_funnel(
-    app: AppConfig,
-    cohort_date: str,
-    return_day_offset: int,
-) -> int | float:
-    """Count first_open users who trigger any event on D1 or D7."""
-    return_date = (
-        datetime.fromisoformat(cohort_date).date()
-        + timedelta(days=return_day_offset)
-    ).isoformat()
-
-    request = RunFunnelReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[
-            AlphaDateRange(start_date=cohort_date, end_date=return_date)
-        ],
-        funnel=Funnel(
-            is_open_funnel=False,
-            steps=[
-                FunnelStep(
-                    name="First open",
-                    filter_expression=first_open_on_date_filter(cohort_date),
-                ),
-                FunnelStep(
-                    name=f"Any event D{return_day_offset}",
-                    filter_expression=alpha_exact_date_filter(return_date),
-                ),
-            ],
-        ),
-        limit=10,
-    )
-    response = alpha_client.run_funnel_report(request=request)
-    return get_funnel_step_active_users(response, 2)
+def parse_cohort_day(value) -> int:
+    text = str(value or "0")
+    digits = re.sub(r"[^0-9]", "", text)
+    return int(digits or 0)
 
 
 def run_retention_report(
     app: AppConfig,
     report_dates: list[str],
 ) -> dict[str, dict]:
-    """Match GA4 UI retention: first_open cohort and Any event return."""
-    if config.retention_days <= 0:
+    """Return API-native retention using the supported firstSessionDate cohort.
+
+    This intentionally avoids funnel-based first_open approximations, which can
+    greatly overcount D1/D7 users. Cohort Total Users, D1 and D7 are therefore
+    produced by one consistent GA4 cohort definition.
+    """
+    if config.retention_days <= 0 or not report_dates:
         return {}
 
-    cohort_totals = run_first_open_cohort_totals(app, report_dates)
-    retention_by_date: dict[str, dict] = {}
-
-    for report_date in report_dates:
-        retention = {
+    retention_by_date: dict[str, dict] = {
+        report_date: {
             "Cohort Total Users": "Not available yet",
             "D1 Active Users": "Not available yet",
             "D1 Retention": "Not available yet",
             "D7 Active Users": "Not available yet",
             "D7 Retention": "Not available yet",
         }
+        for report_date in report_dates
+    }
 
-        if not is_retention_target_ready(report_date, 0):
-            retention_by_date[report_date] = retention
-            continue
+    # The Data API supports at most a limited number of cohorts per request.
+    # Small chunks also keep responses easy to parse and retry.
+    for dates_chunk in chunked(report_dates, 12):
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            dimensions=[
+                Dimension(name="cohort"),
+                Dimension(name="cohortNthDay"),
+            ],
+            metrics=[
+                Metric(name="cohortActiveUsers"),
+                Metric(name="cohortTotalUsers"),
+            ],
+            cohort_spec=CohortSpec(
+                cohorts=[
+                    Cohort(
+                        name=report_date,
+                        dimension="firstSessionDate",
+                        date_range=DateRange(
+                            start_date=report_date,
+                            end_date=report_date,
+                        ),
+                    )
+                    for report_date in dates_chunk
+                ],
+                cohorts_range=CohortsRange(
+                    granularity=CohortsRange.Granularity.DAILY,
+                    start_offset=0,
+                    end_offset=min(max(config.retention_days, 1), 7),
+                ),
+            ),
+            keep_empty_rows=True,
+            limit=100000,
+        )
 
-        cohort_total = cohort_totals.get(report_date, 0)
-        retention["Cohort Total Users"] = cohort_total
+        response = beta_client.run_report(request)
 
-        if config.retention_days >= 1 and is_retention_target_ready(report_date, 1):
-            try:
-                d1_users = run_first_open_return_funnel(app, report_date, 1)
-                retention["D1 Active Users"] = d1_users
-                retention["D1 Retention"] = rate(d1_users, cohort_total)
-            except Exception as error:
-                status, error_text = classify_api_error(error)
-                print(
-                    f"RETENTION D1 {status} for {app.app_name} "
-                    f"on {report_date}: {error_text}"
-                )
-                retention["D1 Active Users"] = "Unavailable"
-                retention["D1 Retention"] = "Unavailable"
+        for row in parse_response_rows(response):
+            report_date = row.get("cohort", "")
+            if report_date not in retention_by_date:
+                continue
 
-        if config.retention_days >= 7 and is_retention_target_ready(report_date, 7):
-            try:
-                d7_users = run_first_open_return_funnel(app, report_date, 7)
-                retention["D7 Active Users"] = d7_users
-                retention["D7 Retention"] = rate(d7_users, cohort_total)
-            except Exception as error:
-                status, error_text = classify_api_error(error)
-                print(
-                    f"RETENTION D7 {status} for {app.app_name} "
-                    f"on {report_date}: {error_text}"
-                )
-                retention["D7 Active Users"] = "Unavailable"
-                retention["D7 Retention"] = "Unavailable"
+            day = parse_cohort_day(row.get("cohortNthDay", 0))
+            active_users = to_number(row.get("cohortActiveUsers", 0))
+            total_users = to_number(row.get("cohortTotalUsers", 0))
+            retention = retention_by_date[report_date]
 
-        retention_by_date[report_date] = retention
+            if is_retention_target_ready(report_date, 0):
+                retention["Cohort Total Users"] = total_users
+
+            if day == 1 and config.retention_days >= 1:
+                if is_retention_target_ready(report_date, 1):
+                    retention["D1 Active Users"] = active_users
+                    retention["D1 Retention"] = rate(active_users, total_users)
+
+            if day == 7 and config.retention_days >= 7:
+                if is_retention_target_ready(report_date, 7):
+                    retention["D7 Active Users"] = active_users
+                    retention["D7 Retention"] = rate(active_users, total_users)
 
     return retention_by_date
 
