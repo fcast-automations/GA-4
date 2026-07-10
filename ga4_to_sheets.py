@@ -1874,19 +1874,5 @@ def main():
         rows.extend(build_rows_for_app(app, report_dates, package_name))
 
     write_sheet(config.merged_sheet, rows)
-
-    date_chunks = (len(report_dates) + 11) // 12
-    approx_ga4_calls_per_app = 1 + 1 + date_chunks + 6 + 7 + 1 + 1
-    if any(not split_csv(app.home_event_names) for app in apps):
-        approx_ga4_calls_per_app += 1
-    print("Done. Only GA4 Merged Data was updated.")
-    print(f"Merged Sheet: {config.merged_sheet}")
-    print(f"Package-date rows written: {len(rows) - 1}")
-    print(f"Approx GA4 Data API calls per app: {approx_ga4_calls_per_app}")
-    print("Firebase Remote Config calls: about 1 per unique Firebase Project ID, cached and reused for Time Capping, IAP Screen, Daily Notifications, and Remote Configuration.")
-    print("FCM Data API calls: about 1 per unique Firebase Android App ID, cached and written inside GA4 Merged Data.")
-    print("No separate report sheets are created or written.")
-
-
 if __name__ == "__main__":
     main()
