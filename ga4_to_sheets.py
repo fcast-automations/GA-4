@@ -1614,16 +1614,22 @@ def build_output_headers() -> list[str]:
             "retention_d1_first_session_retention",
             "retention_d7_first_session_active_users",
             "retention_d7_first_session_retention",
-            # Personalized values are stored as actual row keys. This avoids
-            # fixed columns such as screen_MainActivity or version_1.0.20.
-            "personalized_category",
-            "personalized_key",
-            "personalized_users",
-            "personalized_sessions",
-            "personalized_er",
-            "personalized_avg",
+            # Personalized categories are independent side-by-side row groups.
+            # Values (country, language, version, screen, etc.) stay in cells,
+            # never in fixed or rank-based column names.
         ]
     )
+
+    for _, slug in PERSONALIZED_COLUMN_SPECS:
+        headers.extend(
+            [
+                f"personalized_category_{slug}",
+                f"personalized_{slug}_users",
+                f"personalized_{slug}_sessions",
+                f"personalized_{slug}_er",
+                f"personalized_{slug}_avg",
+            ]
+        )
 
     if len(headers) != len(set(headers)):
         duplicates = sorted({name for name in headers if headers.count(name) > 1})
@@ -1740,19 +1746,19 @@ def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
     row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available yet")
 
 
-def set_personalized_columns(row: dict, category: str, item: dict):
-    """Set one actual Personalized UX key on one row.
+def set_personalized_columns(row: dict, slug: str, item: dict):
+    """Set one Personalized UX item in its category-specific column group.
 
-    Examples of keys are Ukraine, English, mobile, Android, 1.0.20, cpc,
-    MainActivity, or any other value returned by GA4. No value is hardcoded into
-    a column name.
+    The actual value remains data in the category column. For example, Ukraine
+    is written to personalized_category_country; it is never embedded in a
+    header. Each category is independent and can occupy the same output row as
+    the first item from another category.
     """
-    row["personalized_category"] = category
-    row["personalized_key"] = item.get("value", "")
-    row["personalized_users"] = item.get("active", "")
-    row["personalized_sessions"] = item.get("sessions", "")
-    row["personalized_er"] = item.get("engagement", "")
-    row["personalized_avg"] = item.get("avg", "")
+    row[f"personalized_category_{slug}"] = item.get("value", "")
+    row[f"personalized_{slug}_users"] = item.get("active", "")
+    row[f"personalized_{slug}_sessions"] = item.get("sessions", "")
+    row[f"personalized_{slug}_er"] = item.get("engagement", "")
+    row[f"personalized_{slug}_avg"] = item.get("avg", "")
 
 
 def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
@@ -1833,19 +1839,22 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
     rows: list[list] = []
     for report_date in report_dates:
-        # Remote app versions and Personalized UX are independent datasets.
-        # They are compacted side by side by row position so one dataset does
-        # not create an empty vertical block before the other. The first row
-        # also carries the package-date summary fields, removing the previous
-        # blank gap under the dynamic columns.
-        personalized_items: list[tuple[str, dict]] = []
+        # Remote app versions and every Personalized UX category are
+        # independent datasets. They are compacted side by side by row index
+        # so Country, Language, Device Category, Operating System, App Version,
+        # First User Medium, and Screen Class each use their own column group
+        # without creating stacked category blocks or artificial gaps.
         personalized_for_date = personalized_ux.get(report_date, {})
-        for category, _ in PERSONALIZED_COLUMN_SPECS:
-            for item in personalized_for_date.get(category, []):
-                personalized_items.append((category, item))
+        personalized_groups: dict[str, list[dict]] = {
+            slug: personalized_for_date.get(category, [])
+            for category, slug in PERSONALIZED_COLUMN_SPECS
+        }
 
         version_items = remote_versions.get(report_date, [])
-        row_count = max(1, len(version_items), len(personalized_items))
+        row_count = max(
+            [1, len(version_items)]
+            + [len(items) for items in personalized_groups.values()]
+        )
 
         for index in range(row_count):
             output_row = {header: "" for header in OUTPUT_HEADERS}
@@ -1880,12 +1889,13 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             if index < len(version_items):
                 set_remote_version_columns(output_row, version_items[index])
 
-            # Fill the next Personalized UX record independently, when
-            # available. It can share the row with a remote-version record;
-            # there is no analytical relationship implied between them.
-            if index < len(personalized_items):
-                category, item = personalized_items[index]
-                set_personalized_columns(output_row, category, item)
+            # Fill each Personalized UX category independently at the same
+            # row index. Country row 1, Language row 1, Device Category row 1,
+            # and so on appear side by side without implying a relationship.
+            for _, slug in PERSONALIZED_COLUMN_SPECS:
+                items = personalized_groups.get(slug, [])
+                if index < len(items):
+                    set_personalized_columns(output_row, slug, items[index])
 
             rows.append([output_row.get(header, "") for header in OUTPUT_HEADERS])
     return rows
