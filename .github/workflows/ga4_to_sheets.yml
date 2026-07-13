@@ -3,6 +3,8 @@ name: GA4 to Google Sheets
 on:
   workflow_dispatch
 
+  
+
 jobs:
   ga4-to-sheets:
     runs-on: ubuntu-latest
@@ -56,5 +58,6 @@ jobs:
           FETCH_PACKAGE_NAME: ${{ vars.FETCH_PACKAGE_NAME || 'true' }}
           CLEANUP_OLD_TABS: ${{ vars.CLEANUP_OLD_TABS || 'true' }}
           GA4_ADMIN_API_BASE: ${{ vars.GA4_ADMIN_API_BASE || 'https://analyticsadmin.googleapis.com/v1beta' }}
+          GA4_ADMIN_AUDIENCE_API_BASE: ${{ vars.GA4_ADMIN_AUDIENCE_API_BASE || 'https://analyticsadmin.googleapis.com/v1alpha' }}
 
         run: python ga4_to_sheets.py
