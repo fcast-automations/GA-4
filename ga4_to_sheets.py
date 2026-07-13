@@ -424,10 +424,6 @@ def in_list_filter(field_name: str, values: list[str]) -> FilterExpression:
     )
 
 
-def or_filter(expressions: list[FilterExpression]) -> FilterExpression:
-    return FilterExpression(or_group=FilterExpressionList(expressions=expressions))
-
-
 def and_filter(expressions: list[FilterExpression]) -> FilterExpression:
     return FilterExpression(and_group=FilterExpressionList(expressions=expressions))
 
@@ -457,48 +453,63 @@ def parse_response_rows(response) -> list[dict]:
     return [row_to_dict(row, dimension_headers, metric_headers) for row in response.rows]
 
 
-def run_daily_metrics_report(app: AppConfig) -> dict[str, dict]:
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-        dimensions=[Dimension(name="date")],
-        metrics=[
-            Metric(name="activeUsers"),
-            Metric(name="newUsers"),
-            Metric(name="sessions"),
-            Metric(name="engagedSessions"),
-            Metric(name="averageSessionDuration"),
-            Metric(name="userEngagementDuration"),
-            Metric(name="engagementRate"),
-            Metric(name="eventCount"),
-            Metric(name="totalRevenue"),
-        ],
-        order_bys=[date_order()],
-        keep_empty_rows=True,
-        limit=100000,
-    )
-    response = beta_client.run_report(request)
-    by_date = {}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        active_users = to_number(row.get("activeUsers", 0))
-        sessions = to_number(row.get("sessions", 0))
-        session_seconds = to_float(row.get("averageSessionDuration", 0))
-        engagement_seconds = to_float(row.get("userEngagementDuration", 0))
-        by_date[report_date] = {
-            "Active Users": active_users,
-            "New Users": to_number(row.get("newUsers", 0)),
-            "Sessions": sessions,
-            "Engaged Sessions": to_number(row.get("engagedSessions", 0)),
-            "Avg Session Duration": format_seconds(session_seconds),
-            "Avg Session Duration Seconds": round(session_seconds, 2),
-            "Total Engagement Time": format_seconds(engagement_seconds),
-            "Total Engagement Seconds": round(engagement_seconds, 2),
-            "Sessions Per Active User": round(to_float(sessions) / to_float(active_users), 2) if to_float(active_users) else 0,
-            "Engagement Rate": percent(row.get("engagementRate", 0)),
-            "Total Event Count": to_number(row.get("eventCount", 0)),
-            "Total Revenue": round(to_float(row.get("totalRevenue", 0)), 2),
-        }
+def run_time_analysis_report(app: AppConfig) -> dict[str, list[dict]]:
+    """Return session-time metrics broken down by date and country."""
+    by_date: dict[str, list[dict]] = {}
+    page_size = 100000
+    offset = 0
+
+    while True:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+            dimensions=[Dimension(name="date"), Dimension(name="country")],
+            metrics=[
+                Metric(name="activeUsers"),
+                Metric(name="newUsers"),
+                Metric(name="sessions"),
+                Metric(name="engagedSessions"),
+                Metric(name="averageSessionDuration"),
+                Metric(name="userEngagementDuration"),
+                Metric(name="engagementRate"),
+            ],
+            order_bys=[date_order(), metric_order("activeUsers")],
+            keep_empty_rows=False,
+            limit=page_size,
+            offset=offset,
+        )
+        response = beta_client.run_report(request)
+        page_rows = parse_response_rows(response)
+        if not page_rows:
+            break
+
+        for row in page_rows:
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            active_users = to_number(row.get("activeUsers", 0))
+            sessions = to_number(row.get("sessions", 0))
+            session_seconds = to_float(row.get("averageSessionDuration", 0))
+            engagement_seconds = to_float(row.get("userEngagementDuration", 0))
+            by_date.setdefault(report_date, []).append(
+                {
+                    "Country": row.get("country", "") or "(not set)",
+                    "Active Users": active_users,
+                    "New Users": to_number(row.get("newUsers", 0)),
+                    "Sessions": sessions,
+                    "Engaged Sessions": to_number(row.get("engagedSessions", 0)),
+                    "Avg Session Duration": format_seconds(session_seconds),
+                    "Total Engagement Time": format_seconds(engagement_seconds),
+                    "Sessions Per Active User": round(
+                        to_float(sessions) / to_float(active_users),
+                        2,
+                    ) if to_float(active_users) else 0,
+                    "Engagement Rate": percent(row.get("engagementRate", 0)),
+                }
+            )
+
+        if len(page_rows) < page_size:
+            break
+        offset += len(page_rows)
+
     return by_date
 
 
@@ -575,167 +586,155 @@ def parse_cohort_day(value) -> int:
     return int(digits or 0)
 
 
+RETENTION_DAY_OFFSETS = (1, 3, 7, 30)
+
+
 def run_retention_report(
     app: AppConfig,
     report_dates: list[str],
-) -> dict[str, dict]:
-    """Return API-native retention using the supported firstSessionDate cohort.
-
-    This intentionally avoids funnel-based first_open approximations, which can
-    greatly overcount D1/D7 users. Cohort Total Users, D1 and D7 are therefore
-    produced by one consistent GA4 cohort definition.
-    """
-    if config.retention_days <= 0 or not report_dates:
+) -> dict[str, list[dict]]:
+    """Return D1, D3, D7 and D30 first-session retention by country."""
+    if not report_dates:
         return {}
 
-    retention_by_date: dict[str, dict] = {
-        report_date: {
-            "Cohort Total Users": "Not available yet",
-            "D1 Active Users": "Not available yet",
-            "D1 Retention": "Not available yet",
-            "D7 Active Users": "Not available yet",
-            "D7 Retention": "Not available yet",
-        }
-        for report_date in report_dates
+    active_users_by_date_country: dict[str, dict[str, dict[int, int | float]]] = {
+        report_date: {} for report_date in report_dates
     }
 
-    # The Data API supports at most a limited number of cohorts per request.
-    # Small chunks also keep responses easy to parse and retry.
+    # Small cohort chunks keep requests within API limits while still returning
+    # a complete country breakdown through day 30.
     for dates_chunk in chunked(report_dates, 12):
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            dimensions=[
-                Dimension(name="cohort"),
-                Dimension(name="cohortNthDay"),
-            ],
-            metrics=[
-                Metric(name="cohortActiveUsers"),
-                Metric(name="cohortTotalUsers"),
-            ],
-            cohort_spec=CohortSpec(
-                cohorts=[
-                    Cohort(
-                        name=report_date,
-                        dimension="firstSessionDate",
-                        date_range=DateRange(
-                            start_date=report_date,
-                            end_date=report_date,
-                        ),
-                    )
-                    for report_date in dates_chunk
+        page_size = 100000
+        offset = 0
+        while True:
+            request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                dimensions=[
+                    Dimension(name="cohort"),
+                    Dimension(name="cohortNthDay"),
+                    Dimension(name="country"),
                 ],
-                cohorts_range=CohortsRange(
-                    granularity=CohortsRange.Granularity.DAILY,
-                    start_offset=0,
-                    end_offset=min(max(config.retention_days, 1), 7),
+                metrics=[Metric(name="cohortActiveUsers")],
+                cohort_spec=CohortSpec(
+                    cohorts=[
+                        Cohort(
+                            name=report_date,
+                            dimension="firstSessionDate",
+                            date_range=DateRange(
+                                start_date=report_date,
+                                end_date=report_date,
+                            ),
+                        )
+                        for report_date in dates_chunk
+                    ],
+                    cohorts_range=CohortsRange(
+                        granularity=CohortsRange.Granularity.DAILY,
+                        start_offset=0,
+                        end_offset=max(RETENTION_DAY_OFFSETS),
+                    ),
                 ),
-            ),
-            keep_empty_rows=True,
-            limit=100000,
+                keep_empty_rows=True,
+                limit=page_size,
+                offset=offset,
+            )
+
+            response = beta_client.run_report(request)
+            page_rows = parse_response_rows(response)
+            if not page_rows:
+                break
+
+            for row in page_rows:
+                report_date = row.get("cohort", "")
+                if report_date not in active_users_by_date_country:
+                    continue
+
+                country = row.get("country", "") or "(not set)"
+                day = parse_cohort_day(row.get("cohortNthDay", 0))
+                active_users = to_number(row.get("cohortActiveUsers", 0))
+                active_users_by_date_country[report_date].setdefault(country, {})[day] = active_users
+
+            if len(page_rows) < page_size:
+                break
+            offset += len(page_rows)
+
+    retention_by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    for report_date in report_dates:
+        country_rows = active_users_by_date_country.get(report_date, {})
+        sorted_countries = sorted(
+            country_rows.items(),
+            key=lambda item: (-to_float(item[1].get(0, 0)), item[0]),
         )
-
-        response = beta_client.run_report(request)
-
-        for row in parse_response_rows(response):
-            report_date = row.get("cohort", "")
-            if report_date not in retention_by_date:
+        for country, day_values in sorted_countries:
+            if 0 not in day_values or to_float(day_values.get(0, 0)) <= 0:
                 continue
 
-            day = parse_cohort_day(row.get("cohortNthDay", 0))
-            active_users = to_number(row.get("cohortActiveUsers", 0))
-            total_users = to_number(row.get("cohortTotalUsers", 0))
-            retention = retention_by_date[report_date]
-
-            if is_retention_target_ready(report_date, 0):
-                retention["Cohort Total Users"] = total_users
-
-            if day == 1 and config.retention_days >= 1:
-                if is_retention_target_ready(report_date, 1):
-                    retention["D1 Active Users"] = active_users
-                    retention["D1 Retention"] = rate(active_users, total_users)
-
-            if day == 7 and config.retention_days >= 7:
-                if is_retention_target_ready(report_date, 7):
-                    retention["D7 Active Users"] = active_users
-                    retention["D7 Retention"] = rate(active_users, total_users)
+            cohort_country_users = day_values[0]
+            item = {"Country": country}
+            for day_offset in RETENTION_DAY_OFFSETS:
+                key = f"D{day_offset} Retention"
+                if not is_retention_target_ready(report_date, day_offset):
+                    item[key] = "Not available yet"
+                else:
+                    item[key] = rate(day_values.get(day_offset, 0), cohort_country_users)
+            retention_by_date[report_date].append(item)
 
     return retention_by_date
 
-def get_audience_segments():
-    paid_channel_groups = [
-        "Paid Search",
-        "Paid Social",
-        "Paid Video",
-        "Paid Shopping",
-        "Cross-network",
-        "Display",
-        "Paid Other",
+
+def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
+    """Return only audience name, event name, country and total users."""
+    filters = [
+        FilterExpression(not_expression=exact_filter("audienceName", "(not set)")),
+        FilterExpression(
+            not_expression=in_list_filter(
+                "eventName",
+                sorted(EXCLUDED_GA4_EVENT_NAMES),
+            )
+        ),
     ]
-    return [
-        ("All Users", None),
-        ("US Users", exact_filter("country", "United States")),
-        ("Direct Traffic", exact_filter("sessionDefaultChannelGroup", "Direct")),
-        ("Paid Traffic", or_filter([exact_filter("sessionDefaultChannelGroup", channel) for channel in paid_channel_groups])),
-        ("Mobile Traffic", exact_filter("deviceCategory", "mobile")),
-        ("Tablet Traffic", exact_filter("deviceCategory", "tablet")),
-    ]
+    by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    page_size = 100000
+    offset = 0
 
+    while True:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
+            dimensions=[
+                Dimension(name="date"),
+                Dimension(name="audienceName"),
+                Dimension(name="eventName"),
+                Dimension(name="country"),
+            ],
+            metrics=[Metric(name="totalUsers")],
+            dimension_filter=and_filter(filters),
+            order_bys=[date_order(), metric_order("totalUsers")],
+            keep_empty_rows=False,
+            limit=page_size,
+            offset=offset,
+        )
+        response = beta_client.run_report(request)
+        page_rows = parse_response_rows(response)
+        if not page_rows:
+            break
 
-def run_segment_report(app: AppConfig, segment_name: str, segment_filter) -> dict[str, dict]:
-    request_params = {
-        "property": f"properties/{app.property_id}",
-        "date_ranges": [DateRange(start_date=config.start_date, end_date=config.end_date)],
-        "dimensions": [Dimension(name="date")],
-        "metrics": [
-            Metric(name="activeUsers"),
-            Metric(name="newUsers"),
-            Metric(name="sessions"),
-            Metric(name="engagedSessions"),
-            Metric(name="averageSessionDuration"),
-            Metric(name="engagementRate"),
-        ],
-        "order_bys": [date_order()],
-        "keep_empty_rows": True,
-        "limit": 100000,
-    }
-    if segment_filter is not None:
-        request_params["dimension_filter"] = segment_filter
-    response = beta_client.run_report(RunReportRequest(**request_params))
-    result = {}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        result[report_date] = {
-            "segment": segment_name,
-            "active": to_number(row.get("activeUsers", 0)),
-            "new": to_number(row.get("newUsers", 0)),
-            "sessions": to_number(row.get("sessions", 0)),
-            "engaged": to_number(row.get("engagedSessions", 0)),
-            "avg": format_seconds(row.get("averageSessionDuration", 0)),
-            "engagement": percent(row.get("engagementRate", 0)),
-        }
-    return result
+        for row in page_rows:
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            if report_date not in by_date:
+                continue
+            by_date[report_date].append(
+                {
+                    "Audien Name": row.get("audienceName", ""),
+                    "Events Name": row.get("eventName", ""),
+                    "Countries": row.get("country", "") or "(not set)",
+                    "Total_Users": to_number(row.get("totalUsers", 0)),
+                }
+            )
 
+        if len(page_rows) < page_size:
+            break
+        offset += len(page_rows)
 
-def run_all_audience_segments(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
-    by_date = {report_date: [] for report_date in report_dates}
-    for segment_name, segment_filter in get_audience_segments():
-        try:
-            data = run_segment_report(app, segment_name, segment_filter)
-            for report_date in report_dates:
-                row = data.get(report_date, {})
-                by_date[report_date].append(
-                    {
-                        "segment": segment_name,
-                        "active": row.get("active", 0),
-                        "sessions": row.get("sessions", 0),
-                        "engagement": row.get("engagement", "0%"),
-                    }
-                )
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(f"AUDIENCE {segment_name} {status} for {app.app_name}: {error_text}")
-            for report_date in report_dates:
-                by_date[report_date].append({"segment": segment_name, "active": "", "sessions": "", "engagement": status})
     return by_date
 
 
@@ -1392,15 +1391,6 @@ def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict
         f"eventName = screen_view AND {app.screen_field} contains {app.home_screen_name}",
     )
 
-AUDIENCE_SEGMENTS = [
-    ("All Users", "all_users"),
-    ("US Users", "us_users"),
-    ("Direct Traffic", "direct_traffic"),
-    ("Paid Traffic", "paid_traffic"),
-    ("Mobile Traffic", "mobile_traffic"),
-    ("Tablet Traffic", "tablet_traffic"),
-]
-
 PERSONALIZED_COLUMN_SPECS = [
     ("Country", "country"),
     ("Language", "language"),
@@ -1438,14 +1428,14 @@ def build_output_headers() -> list[str]:
     headers = ["Package Name", "Date"]
     headers.extend(FCM_COLUMNS)
 
-    for _, slug in AUDIENCE_SEGMENTS:
-        headers.extend(
-            [
-                f"audience_{slug}/users",
-                f"audience_{slug}/sessions",
-                f"audience_{slug}/er",
-            ]
-        )
+    headers.extend(
+        [
+            "Audien Name",
+            "Events Name",
+            "Countries",
+            "Total_Users",
+        ]
+    )
 
     headers.extend(
         [
@@ -1474,6 +1464,7 @@ def build_output_headers() -> list[str]:
             "iap_screen_value",
             "iap_screen_fetch_percent",
             "iap_screen_last_published",
+            "time_analysis_country",
             "time_analysis_active_users",
             "time_analysis_new_users",
             "time_analysis_sessions",
@@ -1482,11 +1473,11 @@ def build_output_headers() -> list[str]:
             "time_analysis_avg_session_duration",
             "time_analysis_sessions_per_active_user",
             "time_analysis_total_engagement_time",
-            "retention_first_session_cohort_total_users",
-            "retention_d1_first_session_active_users",
+            "retention_country",
             "retention_d1_first_session_retention",
-            "retention_d7_first_session_active_users",
+            "retention_d3_first_session_retention",
             "retention_d7_first_session_retention",
+            "retention_d30_first_session_retention",
             # Personalized categories are independent side-by-side row groups.
             # Values (country, language, version, screen, etc.) stay in cells,
             # never in fixed or rank-based column names.
@@ -1513,13 +1504,11 @@ def build_output_headers() -> list[str]:
 OUTPUT_HEADERS = build_output_headers()
 
 
-def set_audience_columns(row: dict, segments: list[dict]):
-    segment_map = {item.get("segment", ""): item for item in segments}
-    for segment_name, slug in AUDIENCE_SEGMENTS:
-        item = segment_map.get(segment_name, {})
-        row[f"audience_{slug}/users"] = item.get("active", 0)
-        row[f"audience_{slug}/sessions"] = item.get("sessions", 0)
-        row[f"audience_{slug}/er"] = item.get("engagement", "0%")
+def set_audience_columns(row: dict, item: dict):
+    row["Audien Name"] = item.get("Audien Name", "")
+    row["Events Name"] = item.get("Events Name", "")
+    row["Countries"] = item.get("Countries", "")
+    row["Total_Users"] = item.get("Total_Users", "")
 
 
 def set_funnel_columns(
@@ -1567,7 +1556,8 @@ def set_ab_parameter_columns(row: dict, prefix: str, item: dict):
     row[f"{prefix}_last_published"] = item.get("last_published", "")
 
 
-def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
+def set_time_analysis_columns(row: dict, metrics: dict):
+    row["time_analysis_country"] = metrics.get("Country", "")
     row["time_analysis_active_users"] = metrics.get("Active Users", 0)
     row["time_analysis_new_users"] = metrics.get("New Users", 0)
     row["time_analysis_sessions"] = metrics.get("Sessions", 0)
@@ -1577,11 +1567,13 @@ def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
     row["time_analysis_sessions_per_active_user"] = metrics.get("Sessions Per Active User", 0)
     row["time_analysis_total_engagement_time"] = metrics.get("Total Engagement Time", "0m 0s")
 
-    row["retention_first_session_cohort_total_users"] = retention.get("Cohort Total Users", "Not available yet")
-    row["retention_d1_first_session_active_users"] = retention.get("D1 Active Users", "Not available yet")
+
+def set_retention_columns(row: dict, retention: dict):
+    row["retention_country"] = retention.get("Country", "")
     row["retention_d1_first_session_retention"] = retention.get("D1 Retention", "Not available yet")
-    row["retention_d7_first_session_active_users"] = retention.get("D7 Active Users", "Not available yet")
+    row["retention_d3_first_session_retention"] = retention.get("D3 Retention", "Not available yet")
     row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available yet")
+    row["retention_d30_first_session_retention"] = retention.get("D30 Retention", "Not available yet")
 
 
 def set_personalized_columns(row: dict, slug: str, item: dict):
@@ -1619,20 +1611,20 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
         if event_name.lower() not in EXCLUDED_GA4_EVENT_NAMES
     ]
 
-    daily_metrics: dict[str, dict] = {}
+    time_analysis: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
     event_data: dict[tuple[str, str], dict] = {}
     home_data: dict[str, dict] = {}
-    retention_data: dict[str, dict] = {}
-    audience_segments = {report_date: [] for report_date in report_dates}
+    retention_data: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    audience_rows: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
     personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
     fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
     remote_ab = get_remote_config_ab_rows(app)
 
     try:
-        daily_metrics = run_daily_metrics_report(app)
+        time_analysis = run_time_analysis_report(app)
     except Exception as error:
         status, error_text = classify_api_error(error)
-        print(f"DAILY METRICS {status} for {app.app_name}: {error_text}")
+        print(f"TIME ANALYSIS {status} for {app.app_name}: {error_text}")
     try:
         event_data = run_event_report(app, event_names)
     except Exception as error:
@@ -1650,10 +1642,10 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
         status, error_text = classify_api_error(error)
         print(f"RETENTION {status} for {app.app_name}: {error_text}")
     try:
-        audience_segments = run_all_audience_segments(app, report_dates)
+        audience_rows = run_audience_report(app, report_dates)
     except Exception as error:
         status, error_text = classify_api_error(error)
-        print(f"AUDIENCE SEGMENTS {status} for {app.app_name}: {error_text}")
+        print(f"AUDIENCE {status} for {app.app_name}: {error_text}")
     try:
         personalized_ux = run_personalized_ux(app, report_dates)
     except Exception as error:
@@ -1677,8 +1669,18 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
 
         time_capping_items = remote_ab.get("time_capping_rows", []) or []
         iap_screen_items = remote_ab.get("iap_screen_rows", []) or []
+        audience_items = audience_rows.get(report_date, []) or []
+        time_analysis_items = time_analysis.get(report_date, []) or []
+        retention_items = retention_data.get(report_date, []) or []
         row_count = max(
-            [1, len(time_capping_items), len(iap_screen_items)]
+            [
+                1,
+                len(time_capping_items),
+                len(iap_screen_items),
+                len(audience_items),
+                len(time_analysis_items),
+                len(retention_items),
+            ]
             + [len(items) for items in personalized_groups.values()]
         )
 
@@ -1691,13 +1693,14 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             # row for this package and date.
             if index == 0:
                 output_row.update(fcm_delivery.get(report_date, {}))
-                set_audience_columns(output_row, audience_segments.get(report_date, []))
                 set_funnel_columns(output_row, report_date, app, event_data, home_data)
-                set_time_and_retention_columns(
-                    output_row,
-                    daily_metrics.get(report_date, {}),
-                    retention_data.get(report_date, {}),
-                )
+
+            if index < len(audience_items):
+                set_audience_columns(output_row, audience_items[index])
+            if index < len(time_analysis_items):
+                set_time_analysis_columns(output_row, time_analysis_items[index])
+            if index < len(retention_items):
+                set_retention_columns(output_row, retention_items[index])
 
             # Time Capping and IAP parameter records are independent lists.
             # They are aligned side by side by row index only to avoid gaps.
