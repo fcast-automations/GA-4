@@ -598,9 +598,10 @@ def run_retention_report(
     if not report_dates:
         return {}
 
-    active_users_by_date_country: dict[str, dict[str, dict[int, int | float]]] = {
-        report_date: {} for report_date in report_dates
-    }
+    cohort_metrics_by_date_country: dict[
+        str,
+        dict[str, dict[str, int | float | dict[int, int | float]]],
+    ] = {report_date: {} for report_date in report_dates}
 
     # Small cohort chunks keep requests within API limits while still returning
     # a complete country breakdown through day 30.
@@ -615,7 +616,10 @@ def run_retention_report(
                     Dimension(name="cohortNthDay"),
                     Dimension(name="country"),
                 ],
-                metrics=[Metric(name="cohortActiveUsers")],
+                metrics=[
+                    Metric(name="cohortActiveUsers"),
+                    Metric(name="cohortTotalUsers"),
+                ],
                 cohort_spec=CohortSpec(
                     cohorts=[
                         Cohort(
@@ -646,13 +650,21 @@ def run_retention_report(
 
             for row in page_rows:
                 report_date = row.get("cohort", "")
-                if report_date not in active_users_by_date_country:
+                if report_date not in cohort_metrics_by_date_country:
                     continue
 
                 country = row.get("country", "") or "(not set)"
                 day = parse_cohort_day(row.get("cohortNthDay", 0))
                 active_users = to_number(row.get("cohortActiveUsers", 0))
-                active_users_by_date_country[report_date].setdefault(country, {})[day] = active_users
+                total_users = to_number(row.get("cohortTotalUsers", 0))
+
+                country_metrics = cohort_metrics_by_date_country[report_date].setdefault(
+                    country,
+                    {"total_users": 0, "active_users_by_day": {}},
+                )
+                country_metrics["active_users_by_day"][day] = active_users
+                if to_float(total_users) > 0:
+                    country_metrics["total_users"] = total_users
 
             if len(page_rows) < page_size:
                 break
@@ -660,23 +672,27 @@ def run_retention_report(
 
     retention_by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
     for report_date in report_dates:
-        country_rows = active_users_by_date_country.get(report_date, {})
+        country_rows = cohort_metrics_by_date_country.get(report_date, {})
         sorted_countries = sorted(
             country_rows.items(),
-            key=lambda item: (-to_float(item[1].get(0, 0)), item[0]),
+            key=lambda item: (-to_float(item[1].get("total_users", 0)), item[0]),
         )
-        for country, day_values in sorted_countries:
-            if 0 not in day_values or to_float(day_values.get(0, 0)) <= 0:
+        for country, country_metrics in sorted_countries:
+            cohort_total_users = country_metrics.get("total_users", 0)
+            active_users_by_day = country_metrics.get("active_users_by_day", {})
+            if to_float(cohort_total_users) <= 0:
                 continue
 
-            cohort_country_users = day_values[0]
             item = {"Country": country}
             for day_offset in RETENTION_DAY_OFFSETS:
                 key = f"D{day_offset} Retention"
                 if not is_retention_target_ready(report_date, day_offset):
                     item[key] = "Not available yet"
                 else:
-                    item[key] = rate(day_values.get(day_offset, 0), cohort_country_users)
+                    item[key] = rate(
+                        active_users_by_day.get(day_offset, 0),
+                        cohort_total_users,
+                    )
             retention_by_date[report_date].append(item)
 
     return retention_by_date
