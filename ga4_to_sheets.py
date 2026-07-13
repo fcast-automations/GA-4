@@ -56,6 +56,7 @@ analytics_admin_session = None
 remote_config_session = None
 notification_api_session = None
 package_name_cache: dict[str, str] = {}
+ga4_audience_definition_cache: dict[str, dict[str, dict]] = {}
 remote_config_template_cache: dict[str, dict] = {}
 fcm_delivery_cache: dict[tuple[str, str], dict] = {}
 firebase_android_apps_cache: dict[str, list[dict]] = {}
@@ -681,18 +682,131 @@ def run_retention_report(
     return retention_by_date
 
 
+def _append_unique(values: list[str], value) -> None:
+    text = str(value or "").strip()
+    if text and text not in values:
+        values.append(text)
+
+
+def _extract_filter_values(filter_object: dict) -> list[str]:
+    values: list[str] = []
+    string_filter = filter_object.get("stringFilter", {}) or {}
+    _append_unique(values, string_filter.get("value", ""))
+    in_list_filter = filter_object.get("inListFilter", {}) or {}
+    for item in in_list_filter.get("values", []) or []:
+        _append_unique(values, item)
+    return values
+
+
+def _collect_audience_definition_fields(
+    node,
+    event_names: list[str],
+    countries: list[str],
+) -> None:
+    """Recursively collect audience-condition events and country values."""
+    if isinstance(node, list):
+        for item in node:
+            _collect_audience_definition_fields(item, event_names, countries)
+        return
+    if not isinstance(node, dict):
+        return
+
+    event_filter = node.get("eventFilter")
+    if isinstance(event_filter, dict):
+        _append_unique(event_names, event_filter.get("eventName", ""))
+
+    dimension_filter = node.get("dimensionOrMetricFilter")
+    if isinstance(dimension_filter, dict):
+        field_name = str(dimension_filter.get("fieldName", "")).strip().lower()
+        if field_name in {"country", "countryid", "country_id"}:
+            for value in _extract_filter_values(dimension_filter):
+                _append_unique(countries, value)
+
+    for value in node.values():
+        _collect_audience_definition_fields(value, event_names, countries)
+
+
+def fetch_ga4_audience_definitions(app: AppConfig) -> dict[str, dict]:
+    """List audiences from GA4 Admin > Data display > Audiences."""
+    property_id = str(app.property_id).strip()
+    if property_id in ga4_audience_definition_cache:
+        return ga4_audience_definition_cache[property_id]
+
+    definitions: dict[str, dict] = {}
+    try:
+        url = (
+            f"{config.ga4_admin_audience_api_base}/properties/"
+            f"{property_id}/audiences"
+        )
+        params = {"pageSize": 200}
+        while True:
+            response = get_analytics_admin_session().get(url, params=params, timeout=30)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"GA4 Audience Admin API error {response.status_code}: "
+                    f"{response.text}"
+                )
+            payload = response.json()
+            for audience in payload.get("audiences", []) or []:
+                resource_name = str(audience.get("name", "")).strip()
+                display_name = str(audience.get("displayName", "")).strip()
+                if not resource_name and not display_name:
+                    continue
+
+                event_names: list[str] = []
+                countries: list[str] = []
+                _collect_audience_definition_fields(
+                    audience.get("filterClauses", []) or [],
+                    event_names,
+                    countries,
+                )
+
+                # Include the optional GA4 audience-trigger event as well.
+                event_trigger = audience.get("eventTrigger", {}) or {}
+                _append_unique(event_names, event_trigger.get("eventName", ""))
+
+                definition = {
+                    "resource_name": resource_name,
+                    "display_name": display_name,
+                    "events_name": ", ".join(event_names),
+                    "countries": ", ".join(countries),
+                }
+                definitions[resource_name or display_name] = definition
+
+            token = str(payload.get("nextPageToken", "")).strip()
+            if not token:
+                break
+            params["pageToken"] = token
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(
+            f"AUDIENCE ADMIN {status} for {app.app_name} / "
+            f"{app.property_id}: {error_text}"
+        )
+
+    ga4_audience_definition_cache[property_id] = definitions
+    return definitions
+
+
 def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
-    """Return only audience name, event name, country and total users."""
-    filters = [
-        FilterExpression(not_expression=exact_filter("audienceName", "(not set)")),
-        FilterExpression(
-            not_expression=in_list_filter(
-                "eventName",
-                sorted(EXCLUDED_GA4_EVENT_NAMES),
-            )
-        ),
-    ]
+    """Return configured GA4 audiences with country-level total users.
+
+    Audience names and configured event conditions come from the GA4 Admin API.
+    Country and Total_Users come from a separate GA4 Data API report. This avoids
+    requesting eventName together with audience dimensions, which can return an
+    empty or incompatible report.
+    """
+    definitions = fetch_ga4_audience_definitions(app)
+    definitions_by_name = {
+        item.get("display_name", ""): item
+        for item in definitions.values()
+        if item.get("display_name", "")
+    }
+
     by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+    seen_audiences_by_date: dict[str, set[str]] = {
+        report_date: set() for report_date in report_dates
+    }
     page_size = 100000
     offset = 0
 
@@ -703,11 +817,9 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
             dimensions=[
                 Dimension(name="date"),
                 Dimension(name="audienceName"),
-                Dimension(name="eventName"),
                 Dimension(name="country"),
             ],
             metrics=[Metric(name="totalUsers")],
-            dimension_filter=and_filter(filters),
             order_bys=[date_order(), metric_order("totalUsers")],
             keep_empty_rows=False,
             limit=page_size,
@@ -722,10 +834,21 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
             report_date = ga4_date_to_iso(row.get("date", ""))
             if report_date not in by_date:
                 continue
+
+            reported_name = str(row.get("audienceName", "")).strip()
+            if reported_name in {"", "(not set)"}:
+                continue
+
+            definition = definitions_by_name.get(reported_name, {})
+            audience_name = definition.get("display_name", "") or reported_name
+            if not audience_name or audience_name == "(not set)":
+                continue
+
+            seen_audiences_by_date[report_date].add(audience_name)
             by_date[report_date].append(
                 {
-                    "Audien Name": row.get("audienceName", ""),
-                    "Events Name": row.get("eventName", ""),
+                    "Audien Name": audience_name,
+                    "Events Name": definition.get("events_name", ""),
                     "Countries": row.get("country", "") or "(not set)",
                     "Total_Users": to_number(row.get("totalUsers", 0)),
                 }
@@ -734,6 +857,31 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
         if len(page_rows) < page_size:
             break
         offset += len(page_rows)
+
+    # Keep every configured audience visible even when no user row exists for
+    # a date. Definition-level countries are used only as a zero-user fallback.
+    for report_date in report_dates:
+        seen = seen_audiences_by_date[report_date]
+        for definition in definitions.values():
+            audience_key = definition.get("display_name", "")
+            if not audience_key or audience_key in seen:
+                continue
+            by_date[report_date].append(
+                {
+                    "Audien Name": definition.get("display_name", ""),
+                    "Events Name": definition.get("events_name", ""),
+                    "Countries": definition.get("countries", ""),
+                    "Total_Users": 0,
+                }
+            )
+
+        by_date[report_date].sort(
+            key=lambda item: (
+                -to_float(item.get("Total_Users", 0)),
+                str(item.get("Audien Name", "")).lower(),
+                str(item.get("Countries", "")).lower(),
+            )
+        )
 
     return by_date
 
