@@ -1015,6 +1015,117 @@ def summarize_parameter_values(parameter_key: str, parameter: dict, group_name: 
     return lines
 
 
+def get_remote_config_condition_map(template: dict) -> dict[str, str]:
+    """Return Remote Config condition name -> expression."""
+    return {
+        str(condition.get("name", "")): str(condition.get("expression", ""))
+        for condition in (template.get("conditions", []) or [])
+        if condition.get("name")
+    }
+
+
+def extract_fetch_percent(condition_expression: str) -> str:
+    """Best-effort percentage extraction from a Remote Config condition.
+
+    The Remote Config template API does not expose the console's Fetch % as a
+    dedicated parameter field. Default values apply to the remaining audience,
+    so they are represented as 100%. For conditional values, a percentage is
+    returned only when it can be inferred from the condition expression.
+    """
+    expression = str(condition_expression or "")
+    if not expression:
+        return ""
+
+    # Examples commonly seen in Remote Config percentile conditions:
+    # percent <= 50, percent < 25, percent in [10, 40].
+    range_match = re.search(
+        r"percent\s+in\s*\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]",
+        expression,
+        flags=re.IGNORECASE,
+    )
+    if range_match:
+        start = float(range_match.group(1))
+        end = float(range_match.group(2))
+        value = max(end - start, 0)
+        return f"{value:g}%"
+
+    threshold_match = re.search(
+        r"percent\s*(?:<=|<|==)\s*(\d+(?:\.\d+)?)",
+        expression,
+        flags=re.IGNORECASE,
+    )
+    if threshold_match:
+        return f"{float(threshold_match.group(1)):g}%"
+
+    return ""
+
+
+def format_last_published(version: dict) -> str:
+    """Format template-level publication metadata for sheet output."""
+    update_time = str(version.get("updateTime", "") or "").strip()
+    update_user = version.get("updateUser", {}) or {}
+    publisher = str(update_user.get("email", "") or update_user.get("name", "") or "").strip()
+    if publisher and update_time:
+        return f"{publisher} | {update_time}"
+    return publisher or update_time
+
+
+def build_remote_parameter_rows(
+    parameter_key: str,
+    parameter: dict | None,
+    group_name: str,
+    condition_map: dict[str, str],
+    last_published: str,
+    missing_message: str = "",
+) -> list[dict]:
+    """Build structured rows matching Name/Condition/Value/Fetch %/Published."""
+    if parameter is None:
+        return [
+            {
+                "name": parameter_key,
+                "condition": "",
+                "value": missing_message or "Parameter not found",
+                "fetch_percent": "",
+                "last_published": last_published,
+            }
+        ]
+
+    rows: list[dict] = []
+    for value_row in get_parameter_values(parameter):
+        value = value_row.get("value", "")
+        if value == "":
+            continue
+
+        condition_name = str(value_row.get("condition", "") or "").strip()
+        is_default = value_row.get("source") == "Default"
+        condition_label = "Default value" if is_default else condition_name
+        fetch_percent = "100%" if is_default else extract_fetch_percent(condition_map.get(condition_name, ""))
+        display_name = parameter_key if not group_name else f"{group_name}/{parameter_key}"
+
+        rows.append(
+            {
+                "name": display_name,
+                "condition": condition_label,
+                "value": value,
+                "fetch_percent": fetch_percent,
+                "last_published": last_published,
+            }
+        )
+
+    if rows:
+        return rows
+
+    return [
+        {
+            "name": parameter_key,
+            "condition": "",
+            "value": "No configured value",
+            "fetch_percent": "",
+            "last_published": last_published,
+        }
+    ]
+
+
 def find_iap_parameters(template: dict, explicit_key: str) -> list[tuple[str, dict, str]]:
     matches = []
     seen = set()
@@ -1132,35 +1243,74 @@ def summarize_daily_notifications_from_template(app: AppConfig, template: dict) 
 def get_remote_config_static_summaries(app: AppConfig) -> dict:
     empty = {
         "remote_config_static": "Missing Firebase Project ID in Apps Config.",
-        "time_capping": "Missing Firebase Project ID in Apps Config.",
-        "iap_screen": "Missing Firebase Project ID in Apps Config.",
+        "time_capping_rows": [
+            {
+                "name": app.time_capping_parameter or config.time_capping_parameter,
+                "condition": "",
+                "value": "Missing Firebase Project ID in Apps Config.",
+                "fetch_percent": "",
+                "last_published": "",
+            }
+        ],
+        "iap_screen_rows": [
+            {
+                "name": app.iap_screen_parameter or config.iap_screen_parameter,
+                "condition": "",
+                "value": "Missing Firebase Project ID in Apps Config.",
+                "fetch_percent": "",
+                "last_published": "",
+            }
+        ],
         "daily_notifications_static": "Missing Firebase Project ID in Apps Config.",
     }
     if not app.firebase_project_id:
         return empty
+
     try:
         template = get_firebase_remote_config_template(app.firebase_project_id)
         version = template.get("version", {}) or {}
         version_number = version.get("versionNumber", "")
         update_time = version.get("updateTime", "")
+        last_published = format_last_published(version)
         total_parameters = sum(1 for _ in iter_remote_config_parameters(template))
+        condition_map = get_remote_config_condition_map(template)
 
         time_key = app.time_capping_parameter or config.time_capping_parameter
         matched_time_key, time_param, time_group = find_remote_config_parameter(template, time_key)
-        if time_param is None:
-            time_capping = f"Parameter not found: {time_key}"
-        else:
-            time_capping = lines_to_cell(summarize_parameter_values(matched_time_key, time_param, time_group), 25)
+        time_capping_rows = build_remote_parameter_rows(
+            matched_time_key or time_key,
+            time_param,
+            time_group,
+            condition_map,
+            last_published,
+            missing_message=f"Parameter not found: {time_key}",
+        )
 
         iap_key = app.iap_screen_parameter or config.iap_screen_parameter
         iap_matches = find_iap_parameters(template, iap_key)
         if not iap_matches:
-            iap_screen = f"No IAP/paywall config found for {iap_key} or configured IAP keywords."
+            iap_screen_rows = build_remote_parameter_rows(
+                iap_key,
+                None,
+                "",
+                condition_map,
+                last_published,
+                missing_message=(
+                    f"No IAP/paywall config found for {iap_key} or configured IAP keywords."
+                ),
+            )
         else:
-            lines = []
+            iap_screen_rows = []
             for key, parameter, group_name in iap_matches[:20]:
-                lines.extend(summarize_parameter_values(key, parameter, group_name))
-            iap_screen = lines_to_cell(lines, 40)
+                iap_screen_rows.extend(
+                    build_remote_parameter_rows(
+                        key,
+                        parameter,
+                        group_name,
+                        condition_map,
+                        last_published,
+                    )
+                )
 
         daily_notifications = summarize_daily_notifications_from_template(app, template)
         remote_config_static = lines_to_cell(
@@ -1172,8 +1322,8 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
         )
         return {
             "remote_config_static": remote_config_static,
-            "time_capping": time_capping,
-            "iap_screen": iap_screen,
+            "time_capping_rows": time_capping_rows,
+            "iap_screen_rows": iap_screen_rows,
             "daily_notifications_static": daily_notifications,
         }
     except Exception as error:
@@ -1182,8 +1332,24 @@ def get_remote_config_static_summaries(app: AppConfig) -> dict:
         message = f"{status}: {error_text}"
         return {
             "remote_config_static": message,
-            "time_capping": message,
-            "iap_screen": message,
+            "time_capping_rows": [
+                {
+                    "name": app.time_capping_parameter or config.time_capping_parameter,
+                    "condition": "",
+                    "value": message,
+                    "fetch_percent": "",
+                    "last_published": "",
+                }
+            ],
+            "iap_screen_rows": [
+                {
+                    "name": app.iap_screen_parameter or config.iap_screen_parameter,
+                    "condition": "",
+                    "value": message,
+                    "fetch_percent": "",
+                    "last_published": "",
+                }
+            ],
             "daily_notifications_static": message,
         }
 
@@ -1599,8 +1765,16 @@ def build_output_headers() -> list[str]:
             "remote_app_version_users",
             "remote_app_version_sessions",
             "remote_app_version_er",
-            "A/B Test on Time Capping",
-            "A/B Test on IAPs Screen",
+            "time_capping_name",
+            "time_capping_condition",
+            "time_capping_value",
+            "time_capping_fetch_percent",
+            "time_capping_last_published",
+            "iap_screen_name",
+            "iap_screen_condition",
+            "iap_screen_value",
+            "iap_screen_fetch_percent",
+            "iap_screen_last_published",
             "time_analysis_active_users",
             "time_analysis_new_users",
             "time_analysis_sessions",
@@ -1729,6 +1903,14 @@ def set_remote_version_columns(row: dict, item: dict):
     row["remote_app_version_er"] = item.get("er", "")
 
 
+def set_ab_parameter_columns(row: dict, prefix: str, item: dict):
+    row[f"{prefix}_name"] = item.get("name", "")
+    row[f"{prefix}_condition"] = item.get("condition", "")
+    row[f"{prefix}_value"] = item.get("value", "")
+    row[f"{prefix}_fetch_percent"] = item.get("fetch_percent", "")
+    row[f"{prefix}_last_published"] = item.get("last_published", "")
+
+
 def set_time_and_retention_columns(row: dict, metrics: dict, retention: dict):
     row["time_analysis_active_users"] = metrics.get("Active Users", 0)
     row["time_analysis_new_users"] = metrics.get("New Users", 0)
@@ -1851,8 +2033,10 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
         }
 
         version_items = remote_versions.get(report_date, [])
+        time_capping_items = static_remote.get("time_capping_rows", []) or []
+        iap_screen_items = static_remote.get("iap_screen_rows", []) or []
         row_count = max(
-            [1, len(version_items)]
+            [1, len(version_items), len(time_capping_items), len(iap_screen_items)]
             + [len(items) for items in personalized_groups.values()]
         )
 
@@ -1877,8 +2061,6 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
                     static_remote.get("remote_config_static", ""),
                     remote_events.get(report_date, {}),
                 )
-                output_row["A/B Test on Time Capping"] = static_remote.get("time_capping", "")
-                output_row["A/B Test on IAPs Screen"] = static_remote.get("iap_screen", "")
                 set_time_and_retention_columns(
                     output_row,
                     daily_metrics.get(report_date, {}),
@@ -1888,6 +2070,13 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             # Fill the next Remote Config app-version record, when available.
             if index < len(version_items):
                 set_remote_version_columns(output_row, version_items[index])
+
+            # Time Capping and IAP parameter records are independent lists.
+            # They are aligned side by side by row index only to avoid gaps.
+            if index < len(time_capping_items):
+                set_ab_parameter_columns(output_row, "time_capping", time_capping_items[index])
+            if index < len(iap_screen_items):
+                set_ab_parameter_columns(output_row, "iap_screen", iap_screen_items[index])
 
             # Fill each Personalized UX category independently at the same
             # row index. Country row 1, Language row 1, Device Category row 1,
