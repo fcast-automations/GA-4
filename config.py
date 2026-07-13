@@ -76,6 +76,7 @@ class Config:
 
     fetch_package_name: bool
     ga4_admin_api_base: str
+    ga4_admin_audience_api_base: str
     cleanup_old_tabs: bool
 
 
@@ -132,6 +133,10 @@ def load_config() -> Config:
         ga4_admin_api_base=optional_env(
             "GA4_ADMIN_API_BASE",
             "https://analyticsadmin.googleapis.com/v1beta",
+        ),
+        ga4_admin_audience_api_base=optional_env(
+            "GA4_ADMIN_AUDIENCE_API_BASE",
+            "https://analyticsadmin.googleapis.com/v1alpha",
         ),
         cleanup_old_tabs=optional_bool_env("CLEANUP_OLD_TABS", True),
     )
