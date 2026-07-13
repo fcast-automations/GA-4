@@ -564,21 +564,13 @@ def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
 def is_retention_target_ready(
     cohort_date: str,
     day_offset: int,
-    data_lag_days: int = 1,
+    observation_end_date: str,
 ) -> bool:
-    """Return True after the target day should be fully processed by GA4."""
+    """Return True when the requested retention day is inside the report window."""
     cohort_day = datetime.fromisoformat(cohort_date).date()
     target_day = cohort_day + timedelta(days=day_offset)
-    latest_complete_day = (
-        datetime.now(ZoneInfo(config.timezone)).date()
-        - timedelta(days=data_lag_days)
-    )
-    return target_day <= latest_complete_day
-
-
-def chunked(values: list[str], size: int):
-    for index in range(0, len(values), size):
-        yield values[index:index + size]
+    report_end_day = datetime.fromisoformat(observation_end_date).date()
+    return target_day <= report_end_day
 
 
 def parse_cohort_day(value) -> int:
@@ -590,24 +582,31 @@ def parse_cohort_day(value) -> int:
 RETENTION_DAY_OFFSETS = (1, 3, 7, 30)
 
 
+def format_retention_fraction(value) -> str:
+    """Format a GA4 cohort retention fraction with two decimal places."""
+    return f"{to_float(value) * 100:.2f}%"
+
+
 def run_retention_report(
     app: AppConfig,
     report_dates: list[str],
 ) -> dict[str, list[dict]]:
-    """Return D1, D3, D7 and D30 first-session retention by country."""
+    """Return exact daily first-session cohort retention by acquisition date and country."""
+    retention_by_date: dict[str, list[dict]] = {
+        cohort_date: [] for cohort_date in report_dates
+    }
     if not report_dates:
-        return {}
+        return retention_by_date
 
-    cohort_metrics_by_date_country: dict[
-        str,
-        dict[str, dict[str, int | float | dict[int, int | float]]],
-    ] = {report_date: {} for report_date in report_dates}
+    observation_end_date = max(report_dates)
 
-    # Small cohort chunks keep requests within API limits while still returning
-    # a complete country breakdown through day 30.
-    for dates_chunk in chunked(report_dates, 12):
+    # Query each acquisition date as a separate one-day cohort so every output
+    # row maps directly to the matching daily row in GA4 Cohort Exploration.
+    for cohort_date in report_dates:
+        country_data: dict[str, dict] = {}
         page_size = 100000
         offset = 0
+
         while True:
             request = RunReportRequest(
                 property=f"properties/{app.property_id}",
@@ -619,18 +618,21 @@ def run_retention_report(
                 metrics=[
                     Metric(name="cohortActiveUsers"),
                     Metric(name="cohortTotalUsers"),
+                    Metric(
+                        name="cohortRetentionFraction",
+                        expression="cohortActiveUsers/cohortTotalUsers",
+                    ),
                 ],
                 cohort_spec=CohortSpec(
                     cohorts=[
                         Cohort(
-                            name=report_date,
+                            name=cohort_date,
                             dimension="firstSessionDate",
                             date_range=DateRange(
-                                start_date=report_date,
-                                end_date=report_date,
+                                start_date=cohort_date,
+                                end_date=cohort_date,
                             ),
                         )
-                        for report_date in dates_chunk
                     ],
                     cohorts_range=CohortsRange(
                         granularity=CohortsRange.Granularity.DAILY,
@@ -649,51 +651,83 @@ def run_retention_report(
                 break
 
             for row in page_rows:
-                report_date = row.get("cohort", "")
-                if report_date not in cohort_metrics_by_date_country:
+                returned_cohort = str(row.get("cohort", "") or "").strip()
+                if returned_cohort not in {cohort_date, "cohort_0"}:
                     continue
 
-                country = row.get("country", "") or "(not set)"
-                day = parse_cohort_day(row.get("cohortNthDay", 0))
-                active_users = to_number(row.get("cohortActiveUsers", 0))
-                total_users = to_number(row.get("cohortTotalUsers", 0))
+                country = str(row.get("country", "") or "").strip() or "(not set)"
+                day_offset = parse_cohort_day(row.get("cohortNthDay", 0))
+                active_users = to_float(row.get("cohortActiveUsers", 0))
+                total_users = to_float(row.get("cohortTotalUsers", 0))
+                retention_fraction_raw = row.get("cohortRetentionFraction", "")
 
-                country_metrics = cohort_metrics_by_date_country[report_date].setdefault(
+                country_item = country_data.setdefault(
                     country,
-                    {"total_users": 0, "active_users_by_day": {}},
+                    {
+                        "cohort_total_users": 0.0,
+                        "days": {},
+                    },
                 )
-                country_metrics["active_users_by_day"][day] = active_users
-                if to_float(total_users) > 0:
-                    country_metrics["total_users"] = total_users
+                if total_users > 0:
+                    country_item["cohort_total_users"] = max(
+                        to_float(country_item.get("cohort_total_users", 0)),
+                        total_users,
+                    )
+
+                country_item["days"][day_offset] = {
+                    "active_users": active_users,
+                    "total_users": total_users,
+                    "retention_fraction": retention_fraction_raw,
+                }
 
             if len(page_rows) < page_size:
                 break
             offset += len(page_rows)
 
-    retention_by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    for report_date in report_dates:
-        country_rows = cohort_metrics_by_date_country.get(report_date, {})
         sorted_countries = sorted(
-            country_rows.items(),
-            key=lambda item: (-to_float(item[1].get("total_users", 0)), item[0]),
+            country_data.items(),
+            key=lambda item: (
+                -to_float(item[1].get("cohort_total_users", 0)),
+                item[0].lower(),
+            ),
         )
-        for country, country_metrics in sorted_countries:
-            cohort_total_users = country_metrics.get("total_users", 0)
-            active_users_by_day = country_metrics.get("active_users_by_day", {})
-            if to_float(cohort_total_users) <= 0:
+
+        for country, country_item in sorted_countries:
+            cohort_total_users = to_float(country_item.get("cohort_total_users", 0))
+            if cohort_total_users <= 0:
                 continue
 
-            item = {"Country": country}
+            output_item = {
+                "Cohort Date": cohort_date,
+                "Country": country,
+            }
+            day_data = country_item.get("days", {}) or {}
+
             for day_offset in RETENTION_DAY_OFFSETS:
                 key = f"D{day_offset} Retention"
-                if not is_retention_target_ready(report_date, day_offset):
-                    item[key] = "Not available yet"
-                else:
-                    item[key] = rate(
-                        active_users_by_day.get(day_offset, 0),
-                        cohort_total_users,
-                    )
-            retention_by_date[report_date].append(item)
+                if not is_retention_target_ready(
+                    cohort_date,
+                    day_offset,
+                    observation_end_date,
+                ):
+                    output_item[key] = "Not available"
+                    continue
+
+                metrics = day_data.get(day_offset, {}) or {}
+                fraction_value = metrics.get("retention_fraction", "")
+                if fraction_value not in {None, ""}:
+                    output_item[key] = format_retention_fraction(fraction_value)
+                    continue
+
+                denominator = to_float(metrics.get("total_users", 0))
+                if denominator <= 0:
+                    denominator = cohort_total_users
+                numerator = to_float(metrics.get("active_users", 0))
+                output_item[key] = format_retention_fraction(
+                    numerator / denominator if denominator else 0
+                )
+
+            retention_by_date[cohort_date].append(output_item)
 
     return retention_by_date
 
@@ -1707,6 +1741,7 @@ def build_output_headers() -> list[str]:
             "time_analysis_avg_session_duration",
             "time_analysis_sessions_per_active_user",
             "time_analysis_total_engagement_time",
+            "retention_cohort_date",
             "retention_country",
             "retention_d1_first_session_retention",
             "retention_d3_first_session_retention",
@@ -1803,11 +1838,12 @@ def set_time_analysis_columns(row: dict, metrics: dict):
 
 
 def set_retention_columns(row: dict, retention: dict):
+    row["retention_cohort_date"] = retention.get("Cohort Date", "")
     row["retention_country"] = retention.get("Country", "")
-    row["retention_d1_first_session_retention"] = retention.get("D1 Retention", "Not available yet")
-    row["retention_d3_first_session_retention"] = retention.get("D3 Retention", "Not available yet")
-    row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available yet")
-    row["retention_d30_first_session_retention"] = retention.get("D30 Retention", "Not available yet")
+    row["retention_d1_first_session_retention"] = retention.get("D1 Retention", "Not available")
+    row["retention_d3_first_session_retention"] = retention.get("D3 Retention", "Not available")
+    row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available")
+    row["retention_d30_first_session_retention"] = retention.get("D30 Retention", "Not available")
 
 
 def set_personalized_columns(row: dict, slug: str, item: dict):
