@@ -55,7 +55,6 @@ class Config:
 
     default_home_screen_name: str
     default_screen_field: str
-    retention_days: int
 
     app_open_event_names: str
     home_event_names: str
@@ -94,7 +93,6 @@ def load_config() -> Config:
 
         default_home_screen_name=optional_env("DEFAULT_HOME_SCREEN_NAME", "MainActivity"),
         default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
-        retention_days=optional_int_env("RETENTION_DAYS", 7),
 
         app_open_event_names=optional_env(
             "APP_OPEN_EVENT_NAMES",
