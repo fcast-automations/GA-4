@@ -27,7 +27,6 @@ jobs:
           START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
           END_DATE: ${{ vars.END_DATE || 'today' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
-          RETENTION_DAYS: ${{ vars.RETENTION_DAYS || '7' }}
 
           APPS_CONFIG_SHEET: ${{ vars.APPS_CONFIG_SHEET || 'Apps Config' }}
           MERGED_SHEET: ${{ vars.MERGED_SHEET || 'GA4 Merged Data' }}
