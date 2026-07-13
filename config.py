@@ -6,7 +6,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/firebase.remoteconfig",
-    "https://www.googleapis.com/auth/cloud-platform",
 ]
 
 
@@ -57,15 +56,10 @@ class Config:
     default_screen_field: str
     retention_days: int
 
-    notification_event_names: str
-    key_event_names: str
     app_open_event_names: str
     home_event_names: str
     feature_event_names: str
-    notification_parameter_keywords: str
     personalized_top_n: int
-    remote_config_event_limit: int
-    remote_config_app_version_limit: int
 
     time_capping_parameter: str
     iap_screen_parameter: str
@@ -73,9 +67,6 @@ class Config:
     remote_config_namespace: str
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
-    fcm_data_api_base: str
-    firebase_management_api_base: str
-    fcm_data_page_size: int
 
     fetch_package_name: bool
     ga4_admin_api_base: str
@@ -98,14 +89,6 @@ def load_config() -> Config:
         default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
         retention_days=optional_int_env("RETENTION_DAYS", 7),
 
-        notification_event_names=optional_env(
-            "NOTIFICATION_EVENT_NAMES",
-            "notification_receive,notification_foreground,notification_open,notification_dismiss",
-        ),
-        key_event_names=optional_env(
-            "KEY_EVENT_NAMES",
-            "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start",
-        ),
         app_open_event_names=optional_env(
             "APP_OPEN_EVENT_NAMES",
             "session_start,app_open,first_open",
@@ -115,13 +98,7 @@ def load_config() -> Config:
             "FEATURE_EVENT_NAMES",
             optional_env("KEY_EVENT_NAMES", "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start"),
         ),
-        notification_parameter_keywords=optional_env(
-            "NOTIFICATION_PARAMETER_KEYWORDS",
-            "notification,notifications,notify,notif,push,daily_notification,daily_notifications,daily_push,reminder,fcm,title,body,message,time",
-        ),
         personalized_top_n=optional_int_env("PERSONALIZED_TOP_N", 5),
-        remote_config_event_limit=optional_int_env("REMOTE_CONFIG_EVENT_LIMIT", 25),
-        remote_config_app_version_limit=optional_int_env("REMOTE_CONFIG_APP_VERSION_LIMIT", 0),
 
         time_capping_parameter=optional_env("TIME_CAPPING_PARAMETER", "ad_time_capping"),
         iap_screen_parameter=optional_env("IAP_SCREEN_PARAMETER", "iap_screen"),
@@ -135,15 +112,6 @@ def load_config() -> Config:
             "https://firebaseremoteconfig.googleapis.com/v1",
         ),
         firebase_remote_config_timeout=optional_int_env("FIREBASE_REMOTE_CONFIG_TIMEOUT", 30),
-        fcm_data_api_base=optional_env(
-            "FCM_DATA_API_BASE",
-            "https://fcmdata.googleapis.com/v1beta1",
-        ),
-        firebase_management_api_base=optional_env(
-            "FIREBASE_MANAGEMENT_API_BASE",
-            "https://firebase.googleapis.com/v1beta1",
-        ),
-        fcm_data_page_size=optional_int_env("FCM_DATA_PAGE_SIZE", 1000),
 
         fetch_package_name=optional_bool_env("FETCH_PACKAGE_NAME", True),
         ga4_admin_api_base=optional_env(
