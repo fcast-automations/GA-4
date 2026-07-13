@@ -6,6 +6,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/firebase.remoteconfig",
+    "https://www.googleapis.com/auth/cloud-platform",
 ]
 
 
@@ -68,6 +69,12 @@ class Config:
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
 
+    # FCM Data API settings used only for the three retained delivery fields:
+    # firebase_notifications_accepted, firebase_delivered, firebase_pending.
+    fcm_data_api_base: str
+    firebase_management_api_base: str
+    fcm_data_page_size: int
+
     fetch_package_name: bool
     ga4_admin_api_base: str
     cleanup_old_tabs: bool
@@ -112,6 +119,16 @@ def load_config() -> Config:
             "https://firebaseremoteconfig.googleapis.com/v1",
         ),
         firebase_remote_config_timeout=optional_int_env("FIREBASE_REMOTE_CONFIG_TIMEOUT", 30),
+
+        fcm_data_api_base=optional_env(
+            "FCM_DATA_API_BASE",
+            "https://fcmdata.googleapis.com/v1beta1",
+        ),
+        firebase_management_api_base=optional_env(
+            "FIREBASE_MANAGEMENT_API_BASE",
+            "https://firebase.googleapis.com/v1beta1",
+        ),
+        fcm_data_page_size=optional_int_env("FCM_DATA_PAGE_SIZE", 1000),
 
         fetch_package_name=optional_bool_env("FETCH_PACKAGE_NAME", True),
         ga4_admin_api_base=optional_env(
