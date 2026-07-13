@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -53,8 +54,11 @@ credentials = get_credentials()
 beta_client = BetaAnalyticsDataClient(credentials=credentials)
 analytics_admin_session = None
 remote_config_session = None
+notification_api_session = None
 package_name_cache: dict[str, str] = {}
 remote_config_template_cache: dict[str, dict] = {}
+fcm_delivery_cache: dict[tuple[str, str], dict] = {}
+firebase_android_apps_cache: dict[str, list[dict]] = {}
 
 MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
 OLD_REPORT_SHEET_NAMES = {
@@ -1131,6 +1135,230 @@ def get_remote_config_ab_rows(app: AppConfig) -> dict:
 
 
 
+
+# =========================
+# FCM NOTIFICATION DELIVERY
+# =========================
+# The FCM Data API payload contains several delivery statistics. This script
+# intentionally reads only the three retained output fields:
+# - firebase_notifications_accepted
+# - firebase_delivered
+# - firebase_pending
+
+
+def get_notification_api_session():
+    global notification_api_session
+    if notification_api_session is None:
+        notification_api_session = AuthorizedSession(credentials)
+    return notification_api_session
+
+
+def format_fcm_date(date_data: dict) -> str:
+    year = int(date_data.get("year", 0) or 0)
+    month = int(date_data.get("month", 0) or 0)
+    day = int(date_data.get("day", 0) or 0)
+    if year and month and day:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return ""
+
+
+def get_percent(data: dict, key: str) -> str:
+    value = data.get(key, "") if data else ""
+    if value in [None, ""]:
+        return ""
+    try:
+        return f"{round(float(value), 2)}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def looks_like_firebase_app_id(value: str) -> bool:
+    value = str(value or "").strip()
+    return re.match(r"^1:\d+:(android|ios|web):", value) is not None
+
+
+def list_firebase_android_apps(project_identifier: str) -> list[dict]:
+    """Resolve an Android Firebase App ID only when Apps Config lacks one.
+
+    This Firebase Management API request is skipped when Apps Config already
+    contains a canonical Firebase app ID such as 1:123:android:abc.
+    """
+    project_identifier = str(project_identifier or "").strip()
+    if not project_identifier:
+        return []
+    if project_identifier in firebase_android_apps_cache:
+        return firebase_android_apps_cache[project_identifier]
+
+    apps: list[dict] = []
+    page_token = ""
+    while True:
+        parent = f"projects/{quote(project_identifier, safe='-')}"
+        url = f"{config.firebase_management_api_base}/{parent}/androidApps"
+        params = {"pageSize": 100}
+        if page_token:
+            params["pageToken"] = page_token
+        response = get_notification_api_session().get(
+            url,
+            params=params,
+            timeout=config.firebase_remote_config_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Firebase Management API error {response.status_code}: {response.text}"
+            )
+        payload = response.json()
+        apps.extend(payload.get("apps", []) or [])
+        page_token = payload.get("nextPageToken", "")
+        if not page_token:
+            break
+
+    firebase_android_apps_cache[project_identifier] = apps
+    return apps
+
+
+def choose_firebase_android_app(app: AppConfig, apps: list[dict]) -> dict | None:
+    if not apps:
+        return None
+
+    configured_value = str(app.firebase_app_id or "").strip().lower()
+    app_name = str(app.app_name or "").strip().lower()
+
+    if configured_value:
+        for item in apps:
+            if str(item.get("appId", "")).strip().lower() == configured_value:
+                return item
+        for item in apps:
+            if str(item.get("packageName", "")).strip().lower() == configured_value:
+                return item
+
+    if app_name:
+        for item in apps:
+            display_name = str(item.get("displayName", "")).strip().lower()
+            package_name = str(item.get("packageName", "")).strip().lower()
+            if display_name and (display_name in app_name or app_name in display_name):
+                return item
+            if package_name and (package_name in app_name or app_name in package_name):
+                return item
+
+    if len(apps) == 1:
+        return apps[0]
+    return None
+
+
+def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
+    project_identifier = str(app.firebase_project_id or "").strip()
+    configured_app_id = str(app.firebase_app_id or "").strip()
+
+    if not project_identifier:
+        raise ValueError("Firebase Project ID is empty in Apps Config.")
+
+    # Preferred path: no Firebase Management API request.
+    if looks_like_firebase_app_id(configured_app_id):
+        return project_identifier, configured_app_id, "Using Firebase App ID from Apps Config."
+
+    # Fallback path for an empty ID or package-name value.
+    android_apps = list_firebase_android_apps(project_identifier)
+    selected = choose_firebase_android_app(app, android_apps)
+    if selected:
+        note = (
+            "Firebase App ID was empty; auto-resolved from Firebase Android apps list."
+            if not configured_app_id
+            else f"Firebase App ID resolved from Apps Config value '{configured_app_id}'."
+        )
+        return (
+            selected.get("projectId") or project_identifier,
+            selected.get("appId", ""),
+            note,
+        )
+
+    if not configured_app_id:
+        raise ValueError(
+            "Firebase App ID is empty in Apps Config and could not be resolved."
+        )
+    raise ValueError(
+        "Invalid Firebase App ID. Use an Android Firebase App ID like "
+        "1:1234567890:android:abcdef, or a package name resolvable through "
+        "the Firebase Management API."
+    )
+
+
+def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool = False) -> dict:
+    project_part = quote(str(project_id).strip(), safe="-")
+    app_safe = "" if encode_colons else ":"
+    app_part = quote(str(app_id).strip(), safe=app_safe)
+    parent = f"projects/{project_part}/androidApps/{app_part}"
+    url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
+    response = get_notification_api_session().get(
+        url,
+        params={"pageSize": config.fcm_data_page_size},
+        timeout=config.firebase_remote_config_timeout,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"FCM Data API error {response.status_code}: {response.text}")
+    return response.json()
+
+
+def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
+    project_id, app_id, resolution_note = resolve_fcm_project_and_app_id(app)
+    cache_key = (project_id, app_id)
+    if cache_key in fcm_delivery_cache:
+        cached_payload = dict(fcm_delivery_cache[cache_key])
+        cached_payload["_resolution_note"] = resolution_note + " Reused cached response."
+        return cached_payload
+
+    try:
+        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=False)
+    except RuntimeError as error:
+        error_text = str(error)
+        if "400" not in error_text and "INVALID_ARGUMENT" not in error_text:
+            raise
+        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=True)
+        resolution_note += " Retried with encoded Firebase App ID."
+
+    payload["_resolution_note"] = resolution_note
+    fcm_delivery_cache[cache_key] = dict(payload)
+    return payload
+
+
+def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
+    """Return only the three retained FCM values for each requested date."""
+    result: dict[str, dict] = {report_date: {} for report_date in report_dates}
+    try:
+        response = get_fcm_delivery_data_for_app(app)
+        delivery_rows = response.get("androidDeliveryData", []) or []
+        grouped: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
+
+        for delivery in delivery_rows:
+            delivery_date = format_fcm_date(delivery.get("date", {}) or {})
+            if delivery_date in grouped:
+                grouped[delivery_date].append(delivery)
+
+        for report_date, items in grouped.items():
+            if not items:
+                continue
+
+            # Prefer the unlabelled aggregate. It represents the date-level
+            # total and avoids duplicating one row for each analytics label.
+            selected = next(
+                (item for item in items if not str(item.get("analyticsLabel", "") or "").strip()),
+                items[0],
+            )
+            data = selected.get("data", {}) or {}
+            outcome = data.get("messageOutcomePercents", {}) or {}
+            result[report_date] = {
+                "firebase_notifications_accepted": to_number(
+                    data.get("countNotificationsAccepted", 0)
+                ),
+                "firebase_delivered": get_percent(outcome, "delivered"),
+                "firebase_pending": get_percent(outcome, "pending"),
+            }
+
+        return result
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
+        return result
+
 def get_event_metric(event_data: dict, report_date: str, event_name: str) -> dict:
     return event_data.get((report_date, event_name), {}) or {}
 
@@ -1199,8 +1427,16 @@ EXCLUDED_GA4_EVENT_NAMES = {
 }
 
 
+FCM_COLUMNS = [
+    "firebase_notifications_accepted",
+    "firebase_delivered",
+    "firebase_pending",
+]
+
+
 def build_output_headers() -> list[str]:
     headers = ["Package Name", "Date"]
+    headers.extend(FCM_COLUMNS)
 
     for _, slug in AUDIENCE_SEGMENTS:
         headers.extend(
@@ -1389,6 +1625,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     retention_data: dict[str, dict] = {}
     audience_segments = {report_date: [] for report_date in report_dates}
     personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
+    fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
     remote_ab = get_remote_config_ab_rows(app)
 
     try:
@@ -1422,6 +1659,11 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     except Exception as error:
         status, error_text = classify_api_error(error)
         print(f"PERSONALIZED UX {status} for {app.app_name}: {error_text}")
+    try:
+        fcm_delivery = build_fcm_delivery_fields_by_date(app, report_dates)
+    except Exception as error:
+        status, error_text = classify_api_error(error)
+        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
     rows: list[list] = []
     for report_date in report_dates:
         # Personalized UX categories are independent datasets. They are
@@ -1448,6 +1690,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
             # Store date-level summary metrics only once, on the first compact
             # row for this package and date.
             if index == 0:
+                output_row.update(fcm_delivery.get(report_date, {}))
                 set_audience_columns(output_row, audience_segments.get(report_date, []))
                 set_funnel_columns(output_row, report_date, app, event_data, home_data)
                 set_time_and_retention_columns(
