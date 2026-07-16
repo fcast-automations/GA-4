@@ -1,7 +1,11 @@
 import json
+import os
 import re
+import tempfile
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
@@ -21,7 +25,8 @@ from google.analytics.data_v1beta.types import (
     OrderBy,
     RunReportRequest,
 )
-from googleapiclient.discovery import build
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery
 
 from config import SCOPES, load_config
 
@@ -64,93 +69,225 @@ remote_config_template_cache: dict[str, dict] = {}
 fcm_delivery_cache: dict[tuple[str, str], dict] = {}
 firebase_android_apps_cache: dict[str, list[dict]] = {}
 
-MAX_GOOGLE_SHEETS_CELL_CHARS = 49000
-OLD_REPORT_SHEET_NAMES = {
-    "GA4 Funnel Summary",
-    "GA4 Funnel Details",
-    "GA4 User Session Summary",
-    "GA4 Retention Details",
-    "GA4 Audience Segments",
-    "GA4 Personalized User Experience",
-    "GA4 Remote Configuration",
-    "Firebase AB Time Capping",
-    "Firebase AB IAP Screen",
-    "GA4 Notification Events",
-    "Firebase Notification Delivery",
-    "Firebase Daily Notifications",
-}
+
+BIGQUERY_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
 
 
-def trim_cell_value(value, max_chars: int = MAX_GOOGLE_SHEETS_CELL_CHARS):
-    if value is None:
-        return ""
-    text = str(value)
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 40] + " ... [trimmed to fit Google Sheets cell limit]"
+def validate_bigquery_identifier(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    if not BIGQUERY_IDENTIFIER_RE.fullmatch(text):
+        raise ValueError(
+            f"{label} must start with a letter or underscore and contain only "
+            f"letters, numbers, and underscores. Current value: {text!r}"
+        )
+    return text
 
 
-def sanitize_rows_for_google_sheets(rows: list[list]) -> list[list]:
-    return [[trim_cell_value(value) for value in row] for row in rows]
+def normalize_bigquery_field_name(header: str) -> str:
+    """Convert a report header into a stable Standard SQL field name."""
+    value = re.sub(r"[^A-Za-z0-9_]+", "_", str(header or "").strip()).strip("_").lower()
+    value = re.sub(r"_+", "_", value)
+    if not value:
+        value = "field"
+    if value[0].isdigit():
+        value = f"field_{value}"
+    return value[:300]
 
 
-def get_sheets_service():
-    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+def build_bigquery_field_map() -> dict[str, str]:
+    """Return a collision-safe map from legacy output headers to BQ fields."""
+    result: dict[str, str] = {}
+    used: set[str] = set()
+    for header in OUTPUT_HEADERS:
+        base = normalize_bigquery_field_name(header)
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        result[header] = candidate
+        used.add(candidate)
+    return result
 
 
-def ensure_sheet_exists(service, sheet_name: str):
-    spreadsheet = service.spreadsheets().get(
-        spreadsheetId=config.spreadsheet_id,
-        fields="sheets.properties(title)",
-    ).execute()
-    existing = {sheet.get("properties", {}).get("title", "") for sheet in spreadsheet.get("sheets", [])}
-    if sheet_name in existing:
-        return
-    service.spreadsheets().batchUpdate(
-        spreadsheetId=config.spreadsheet_id,
-        body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
-    ).execute()
+def build_bigquery_schema(field_map: dict[str, str]) -> list[bigquery.SchemaField]:
+    schema: list[bigquery.SchemaField] = []
+    for header in OUTPUT_HEADERS:
+        field_type = "DATE" if header == "Date" else "STRING"
+        schema.append(
+            bigquery.SchemaField(
+                field_map[header],
+                field_type,
+                mode="NULLABLE",
+                description=f"GA4 export field. Original report heading: {header}",
+            )
+        )
+    schema.extend(
+        [
+            bigquery.SchemaField(
+                "exported_at",
+                "TIMESTAMP",
+                mode="REQUIRED",
+                description="UTC time at which this export run was generated.",
+            ),
+            bigquery.SchemaField(
+                "export_run_id",
+                "STRING",
+                mode="REQUIRED",
+                description="Unique identifier shared by all rows from one workflow run.",
+            ),
+        ]
+    )
+    return schema
 
 
-def cleanup_old_report_sheets(service):
-    if not config.cleanup_old_tabs:
-        return
-    spreadsheet = service.spreadsheets().get(
-        spreadsheetId=config.spreadsheet_id,
-        fields="sheets.properties(sheetId,title)",
-    ).execute()
-    protected = {config.merged_sheet}
-    requests = []
-    names = []
-    for sheet in spreadsheet.get("sheets", []):
-        props = sheet.get("properties", {})
-        title = props.get("title", "")
-        if title in OLD_REPORT_SHEET_NAMES and title not in protected:
-            requests.append({"deleteSheet": {"sheetId": props["sheetId"]}})
-            names.append(title)
-    if requests:
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=config.spreadsheet_id,
-            body={"requests": requests},
-        ).execute()
-        print("Deleted old report tabs: " + ", ".join(names))
+def value_for_bigquery(value):
+    """Preserve report formatting while writing blanks as SQL NULL."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
 
 
-def write_sheet(sheet_name: str, rows: list[list]):
-    service = get_sheets_service()
-    ensure_sheet_exists(service, sheet_name)
-    cleanup_old_report_sheets(service)
-    service.spreadsheets().values().clear(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{sheet_name}!A:ZZ",
-        body={},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=config.spreadsheet_id,
-        range=f"{sheet_name}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": sanitize_rows_for_google_sheets(rows)},
-    ).execute()
+def output_values_to_bigquery_record(
+    values: list,
+    field_map: dict[str, str],
+    exported_at: str,
+    export_run_id: str,
+) -> dict:
+    if len(values) != len(OUTPUT_HEADERS):
+        raise ValueError(
+            f"Output row has {len(values)} values but {len(OUTPUT_HEADERS)} headers exist."
+        )
+    record: dict = {}
+    for header, value in zip(OUTPUT_HEADERS, values):
+        field_name = field_map[header]
+        if header == "Date":
+            record[field_name] = str(value).strip() if value not in {None, ""} else None
+        else:
+            record[field_name] = value_for_bigquery(value)
+    record["exported_at"] = exported_at
+    record["export_run_id"] = export_run_id
+    return record
+
+
+def get_bigquery_client() -> bigquery.Client:
+    project_id = str(config.bigquery_project_id or credentials.project_id or "").strip()
+    if not project_id:
+        raise ValueError(
+            "BIGQUERY_PROJECT_ID is empty and no project_id exists in the service-account JSON."
+        )
+    return bigquery.Client(
+        project=project_id,
+        credentials=credentials,
+        location=config.bigquery_location,
+    )
+
+
+def ensure_bigquery_dataset(client: bigquery.Client) -> bigquery.Dataset:
+    dataset_id = validate_bigquery_identifier(config.bigquery_dataset, "BIGQUERY_DATASET")
+    dataset_ref = bigquery.DatasetReference(client.project, dataset_id)
+    try:
+        dataset = client.get_dataset(dataset_ref)
+        existing_location = str(dataset.location or "").upper()
+        requested_location = str(config.bigquery_location or "").upper()
+        if existing_location and requested_location and existing_location != requested_location:
+            raise ValueError(
+                f"Existing dataset {dataset_ref} is in {existing_location}, but "
+                f"BIGQUERY_LOCATION is {requested_location}."
+            )
+        return dataset
+    except NotFound:
+        if not config.bigquery_create_dataset:
+            raise RuntimeError(
+                f"BigQuery dataset {dataset_ref} does not exist. Create it first or set "
+                "BIGQUERY_CREATE_DATASET=true."
+            )
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = config.bigquery_location
+        dataset.description = "GA4 and Firebase reporting generated by the GA4 export workflow."
+        created = client.create_dataset(dataset)
+        print(f"Created BigQuery dataset: {created.full_dataset_id}")
+        return created
+
+
+def write_ndjson_records(file_handle, rows: list[list], field_map: dict[str, str], exported_at: str, export_run_id: str) -> int:
+    count = 0
+    for values in rows:
+        record = output_values_to_bigquery_record(
+            values,
+            field_map,
+            exported_at,
+            export_run_id,
+        )
+        file_handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        file_handle.write("\n")
+        count += 1
+    return count
+
+
+def load_ndjson_file_to_bigquery(ndjson_path: str, row_count: int, field_map: dict[str, str]) -> str:
+    if row_count <= 0:
+        raise RuntimeError("No report rows were generated; BigQuery was not modified.")
+
+    client = get_bigquery_client()
+    ensure_bigquery_dataset(client)
+    table_name = validate_bigquery_identifier(config.bigquery_table, "BIGQUERY_TABLE")
+    table_id = f"{client.project}.{config.bigquery_dataset}.{table_name}"
+
+    write_disposition = str(config.bigquery_write_disposition or "WRITE_TRUNCATE").upper()
+    allowed = {"WRITE_TRUNCATE", "WRITE_APPEND", "WRITE_EMPTY"}
+    if write_disposition not in allowed:
+        raise ValueError(
+            f"BIGQUERY_WRITE_DISPOSITION must be one of {sorted(allowed)}. "
+            f"Current value: {write_disposition}"
+        )
+
+    job_config = bigquery.LoadJobConfig(
+        schema=build_bigquery_schema(field_map),
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=write_disposition,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+        ignore_unknown_values=False,
+        max_bad_records=0,
+        time_partitioning=bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field=field_map["Date"],
+        ),
+        clustering_fields=[
+            field_map["Package Name"],
+            field_map["GA4 Property ID"],
+        ],
+    )
+    if write_disposition == "WRITE_APPEND":
+        job_config.schema_update_options = [
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION,
+        ]
+
+    file_size = os.path.getsize(ndjson_path)
+    print(
+        f"Loading {row_count:,} rows ({file_size / 1024 / 1024:.2f} MiB) into "
+        f"BigQuery table {table_id} using {write_disposition}..."
+    )
+    with open(ndjson_path, "rb") as source_file:
+        load_job = client.load_table_from_file(
+            source_file,
+            table_id,
+            job_config=job_config,
+            location=config.bigquery_location,
+            rewind=True,
+            size=file_size,
+        )
+        load_job.result()
+
+    table = client.get_table(table_id)
+    print(
+        f"BigQuery load complete: {table_id}; current table rows: "
+        f"{int(table.num_rows or 0):,}."
+    )
+    return table_id
 
 
 def list_accessible_ga4_property_summaries() -> list[dict]:
@@ -1361,7 +1498,11 @@ def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, li
     return by_date
 
 
-def get_personalized_ux_dimensions() -> list[tuple[str, str]]:
+def get_personalized_ux_dimensions(app: AppConfig) -> list[tuple[str, str]]:
+    # Reuse the dimension that successfully returned screen_view data during
+    # per-app home-screen detection. This avoids assuming one universal screen
+    # field such as unifiedPagePathScreen across every app.
+    screen_dimension = app.screen_field or "unifiedScreenClass"
     return [
         ("Country", "country"),
         ("Language", "language"),
@@ -1369,7 +1510,7 @@ def get_personalized_ux_dimensions() -> list[tuple[str, str]]:
         ("Operating System", "operatingSystem"),
         ("App Version", "appVersion"),
         ("First User Medium", "firstUserMedium"),
-        ("Top Screens / Screen Class", "unifiedPagePathScreen"),
+        ("Top Screens / Screen Class", screen_dimension),
     ]
 
 
@@ -1439,7 +1580,7 @@ def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str
 def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, dict[str, list[dict]]]:
     """Return structured top values for each personalized dimension and date."""
     result = {report_date: {} for report_date in report_dates}
-    for label, dimension_name in get_personalized_ux_dimensions():
+    for label, dimension_name in get_personalized_ux_dimensions(app):
         try:
             by_date = run_dimension_session_report(app, label, dimension_name, report_dates)
             for report_date in report_dates:
@@ -2432,6 +2573,7 @@ def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: st
     return rows
 
 
+
 def main():
     print("Discovering all Android GA4 apps accessible to the service account...")
     apps = discover_apps_from_service_account()
@@ -2439,17 +2581,50 @@ def main():
     print(f"Total accessible Android apps found: {len(apps)}")
     print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
 
-    rows = [OUTPUT_HEADERS]
+    field_map = build_bigquery_field_map()
+    export_run_id = uuid.uuid4().hex
+    exported_at = datetime.now(timezone.utc).isoformat()
+    temp_path = ""
+    total_rows = 0
 
-    for app in apps:
-        package_name = fetch_ga4_package_name(app)
-        if package_name:
-            print(f"Package name found for {app.app_name}: {package_name}")
-        else:
-            print(f"Package name not found for {app.app_name}; final Package Name cell will be blank.")
-        rows.extend(build_rows_for_app(app, report_dates, package_name))
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            suffix=".ndjson",
+            prefix="ga4_bigquery_",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            for app in apps:
+                package_name = fetch_ga4_package_name(app)
+                if package_name:
+                    print(f"Package name found for {app.app_name}: {package_name}")
+                else:
+                    print(
+                        f"Package name not found for {app.app_name}; "
+                        "the BigQuery package_name field will be NULL."
+                    )
+                app_rows = build_rows_for_app(app, report_dates, package_name)
+                written = write_ndjson_records(
+                    temp_file,
+                    app_rows,
+                    field_map,
+                    exported_at,
+                    export_run_id,
+                )
+                total_rows += written
+                print(f"Prepared {written:,} BigQuery rows for {app.app_name}.")
 
-    write_sheet(config.merged_sheet, rows)
+        table_id = load_ndjson_file_to_bigquery(temp_path, total_rows, field_map)
+        print(
+            f"Export finished successfully. Run ID: {export_run_id}; "
+            f"rows loaded: {total_rows:,}; table: {table_id}."
+        )
+    finally:
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
