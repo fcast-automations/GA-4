@@ -28,8 +28,8 @@ def optional_int_env(name: str, default: int) -> int:
     value = optional_env(name, str(default))
     try:
         return int(value)
-    except ValueError:
-        raise ValueError(f"{name} must be a number. Current value: {value}")
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number. Current value: {value}") from error
 
 
 def optional_bool_env(name: str, default: bool) -> bool:
@@ -46,6 +46,8 @@ class Config:
     spreadsheet_id: str
     service_account_json: str
 
+    # Retained for backward compatibility and cleanup protection. The updated
+    # report script no longer reads the app list from this sheet.
     apps_config_sheet: str
     merged_sheet: str
 
@@ -92,8 +94,14 @@ def load_config() -> Config:
         end_date=optional_env("END_DATE", "today"),
         timezone=optional_env("TIMEZONE", "Asia/Karachi"),
 
-        default_home_screen_name=optional_env("DEFAULT_HOME_SCREEN_NAME", "MainActivity"),
-        default_screen_field=optional_env("DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"),
+        default_home_screen_name=optional_env(
+            "DEFAULT_HOME_SCREEN_NAME",
+            "MainActivity",
+        ),
+        default_screen_field=optional_env(
+            "DEFAULT_SCREEN_FIELD",
+            "unifiedPagePathScreen",
+        ),
 
         app_open_event_names=optional_env(
             "APP_OPEN_EVENT_NAMES",
@@ -102,22 +110,38 @@ def load_config() -> Config:
         home_event_names=optional_env("HOME_EVENT_NAMES", ""),
         feature_event_names=optional_env(
             "FEATURE_EVENT_NAMES",
-            optional_env("KEY_EVENT_NAMES", "ad_impression,in_app_purchase,purchase,begin_checkout,subscribe,trial_start"),
+            optional_env(
+                "KEY_EVENT_NAMES",
+                "ad_impression,in_app_purchase,purchase,begin_checkout,"
+                "subscribe,trial_start",
+            ),
         ),
         personalized_top_n=optional_int_env("PERSONALIZED_TOP_N", 5),
 
-        time_capping_parameter=optional_env("TIME_CAPPING_PARAMETER", "ad_time_capping"),
+        time_capping_parameter=optional_env(
+            "TIME_CAPPING_PARAMETER",
+            "ad_time_capping",
+        ),
         iap_screen_parameter=optional_env("IAP_SCREEN_PARAMETER", "iap_screen"),
         iap_screen_parameter_keywords=optional_env(
             "IAP_SCREEN_PARAMETER_KEYWORDS",
-            "iap_screen,iap_screen_variant,iap_paywall,iap,paywall,premium_screen,subscription_screen,subscribe_screen,purchase_screen,pro_screen,upgrade_screen,offers_screen,pricing_screen",
+            "iap_screen,iap_screen_variant,iap_paywall,iap,paywall,"
+            "premium_screen,subscription_screen,subscribe_screen,"
+            "purchase_screen,pro_screen,upgrade_screen,offers_screen,"
+            "pricing_screen",
         ),
-        remote_config_namespace=optional_env("REMOTE_CONFIG_NAMESPACE", "firebase"),
+        remote_config_namespace=optional_env(
+            "REMOTE_CONFIG_NAMESPACE",
+            "firebase",
+        ),
         firebase_remote_config_api_base=optional_env(
             "FIREBASE_REMOTE_CONFIG_API_BASE",
             "https://firebaseremoteconfig.googleapis.com/v1",
         ),
-        firebase_remote_config_timeout=optional_int_env("FIREBASE_REMOTE_CONFIG_TIMEOUT", 30),
+        firebase_remote_config_timeout=optional_int_env(
+            "FIREBASE_REMOTE_CONFIG_TIMEOUT",
+            30,
+        ),
 
         fcm_data_api_base=optional_env(
             "FCM_DATA_API_BASE",
