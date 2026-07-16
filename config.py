@@ -45,21 +45,15 @@ def optional_bool_env(name: str, default: bool) -> bool:
 class Config:
     spreadsheet_id: str
     service_account_json: str
-
-    # Retained for backward compatibility and cleanup protection. The updated
-    # report script no longer reads the app list from this sheet.
-    apps_config_sheet: str
     merged_sheet: str
 
     start_date: str
     end_date: str
     timezone: str
 
-    default_home_screen_name: str
-    default_screen_field: str
-
     app_open_event_names: str
     home_event_names: str
+    home_screen_overrides_json: str
     feature_event_names: str
     personalized_top_n: int
 
@@ -70,8 +64,6 @@ class Config:
     firebase_remote_config_api_base: str
     firebase_remote_config_timeout: int
 
-    # FCM Data API settings used only for the three retained delivery fields:
-    # firebase_notifications_accepted, firebase_delivered, firebase_pending.
     fcm_data_api_base: str
     firebase_management_api_base: str
     fcm_data_page_size: int
@@ -86,28 +78,26 @@ def load_config() -> Config:
     return Config(
         spreadsheet_id=required_env("SPREADSHEET_ID"),
         service_account_json=required_env("GA4_SERVICE_ACCOUNT_JSON"),
-
-        apps_config_sheet=optional_env("APPS_CONFIG_SHEET", "Apps Config"),
         merged_sheet=optional_env("MERGED_SHEET", "GA4 Merged Data"),
 
         start_date=optional_env("START_DATE", "7daysAgo"),
         end_date=optional_env("END_DATE", "today"),
         timezone=optional_env("TIMEZONE", "Asia/Karachi"),
 
-        default_home_screen_name=optional_env(
-            "DEFAULT_HOME_SCREEN_NAME",
-            "MainActivity",
-        ),
-        default_screen_field=optional_env(
-            "DEFAULT_SCREEN_FIELD",
-            "unifiedPagePathScreen",
-        ),
-
         app_open_event_names=optional_env(
             "APP_OPEN_EVENT_NAMES",
             "session_start,app_open,first_open",
         ),
+        # Optional override. Leave empty to auto-detect the home screen for
+        # every app independently from screen_view data.
         home_event_names=optional_env("HOME_EVENT_NAMES", ""),
+        # Optional per-app fallback when automatic screen detection is not
+        # suitable. Keys may be package name, Firebase App ID, GA4 stream ID,
+        # GA4 property ID, or discovered app name.
+        home_screen_overrides_json=optional_env(
+            "HOME_SCREEN_OVERRIDES_JSON",
+            "{}",
+        ),
         feature_event_names=optional_env(
             "FEATURE_EVENT_NAMES",
             optional_env(
