@@ -1,17 +1,19 @@
-import json
-import os
-import re
-import tempfile
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from zoneinfo import ZoneInfo
-from urllib.parse import quote
+from __future__ import annotations
 
-from google.auth.transport.requests import AuthorizedSession
-from google.oauth2 import service_account
+import json
+import logging
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.api_core.exceptions import NotFound
 from google.analytics.data_v1beta.types import (
     Cohort,
     CohortSpec,
@@ -25,2194 +27,19 @@ from google.analytics.data_v1beta.types import (
     OrderBy,
     RunReportRequest,
 )
-from google.api_core.exceptions import NotFound
+from google.auth.credentials import Credentials
+from google.auth.transport.requests import AuthorizedSession
 from google.cloud import bigquery
+from google.oauth2 import service_account
+from requests import Response
 
-from config import SCOPES, load_config
+from config import Config, SCOPES, load_config
 
 
-config = load_config()
+LOGGER = logging.getLogger("ga4-firebase-bigquery")
 
-
-@dataclass
-class AppConfig:
-    app_name: str
-    property_id: str
-    firebase_project_id: str
-    firebase_project_name: str
-    firebase_app_id: str
-    time_capping_parameter: str
-    iap_screen_parameter: str
-    app_open_event_names: str
-    home_event_names: str
-    feature_event_names: str
-    ga4_stream_id: str = ""
-    package_name: str = ""
-    home_screen_name: str = ""
-    screen_field: str = ""
-    home_detection_method: str = ""
-
-
-def get_credentials():
-    service_account_info = json.loads(config.service_account_json)
-    return service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-
-
-credentials = get_credentials()
-beta_client = BetaAnalyticsDataClient(credentials=credentials)
-analytics_admin_session = None
-remote_config_session = None
-notification_api_session = None
-package_name_cache: dict[str, str] = {}
-ga4_audience_definition_cache: dict[str, dict[str, dict]] = {}
-remote_config_template_cache: dict[str, dict] = {}
-fcm_delivery_cache: dict[tuple[str, str], dict] = {}
-firebase_android_apps_cache: dict[str, list[dict]] = {}
-
-
-BIGQUERY_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
-
-
-def validate_bigquery_identifier(value: str, label: str) -> str:
-    text = str(value or "").strip()
-    if not BIGQUERY_IDENTIFIER_RE.fullmatch(text):
-        raise ValueError(
-            f"{label} must start with a letter or underscore and contain only "
-            f"letters, numbers, and underscores. Current value: {text!r}"
-        )
-    return text
-
-
-def normalize_bigquery_field_name(header: str) -> str:
-    """Convert a report header into a stable Standard SQL field name."""
-    value = re.sub(r"[^A-Za-z0-9_]+", "_", str(header or "").strip()).strip("_").lower()
-    value = re.sub(r"_+", "_", value)
-    if not value:
-        value = "field"
-    if value[0].isdigit():
-        value = f"field_{value}"
-    return value[:300]
-
-
-def build_bigquery_field_map() -> dict[str, str]:
-    """Return a collision-safe map from legacy output headers to BQ fields."""
-    result: dict[str, str] = {}
-    used: set[str] = set()
-    for header in OUTPUT_HEADERS:
-        base = normalize_bigquery_field_name(header)
-        candidate = base
-        suffix = 2
-        while candidate in used:
-            candidate = f"{base}_{suffix}"
-            suffix += 1
-        result[header] = candidate
-        used.add(candidate)
-    return result
-
-
-def build_bigquery_schema(field_map: dict[str, str]) -> list[bigquery.SchemaField]:
-    schema: list[bigquery.SchemaField] = []
-    for header in OUTPUT_HEADERS:
-        field_type = "DATE" if header == "Date" else "STRING"
-        schema.append(
-            bigquery.SchemaField(
-                field_map[header],
-                field_type,
-                mode="NULLABLE",
-                description=f"GA4 export field. Original report heading: {header}",
-            )
-        )
-    schema.extend(
-        [
-            bigquery.SchemaField(
-                "exported_at",
-                "TIMESTAMP",
-                mode="REQUIRED",
-                description="UTC time at which this export run was generated.",
-            ),
-            bigquery.SchemaField(
-                "export_run_id",
-                "STRING",
-                mode="REQUIRED",
-                description="Unique identifier shared by all rows from one workflow run.",
-            ),
-        ]
-    )
-    return schema
-
-
-def value_for_bigquery(value):
-    """Preserve report formatting while writing blanks as SQL NULL."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value)
-
-
-def output_values_to_bigquery_record(
-    values: list,
-    field_map: dict[str, str],
-    exported_at: str,
-    export_run_id: str,
-) -> dict:
-    if len(values) != len(OUTPUT_HEADERS):
-        raise ValueError(
-            f"Output row has {len(values)} values but {len(OUTPUT_HEADERS)} headers exist."
-        )
-    record: dict = {}
-    for header, value in zip(OUTPUT_HEADERS, values):
-        field_name = field_map[header]
-        if header == "Date":
-            record[field_name] = str(value).strip() if value not in {None, ""} else None
-        else:
-            record[field_name] = value_for_bigquery(value)
-    record["exported_at"] = exported_at
-    record["export_run_id"] = export_run_id
-    return record
-
-
-def get_bigquery_client() -> bigquery.Client:
-    project_id = str(config.bigquery_project_id or credentials.project_id or "").strip()
-    if not project_id:
-        raise ValueError(
-            "BIGQUERY_PROJECT_ID is empty and no project_id exists in the service-account JSON."
-        )
-    return bigquery.Client(
-        project=project_id,
-        credentials=credentials,
-        location=config.bigquery_location,
-    )
-
-
-def ensure_bigquery_dataset(client: bigquery.Client) -> bigquery.Dataset:
-    dataset_id = validate_bigquery_identifier(config.bigquery_dataset, "BIGQUERY_DATASET")
-    dataset_ref = bigquery.DatasetReference(client.project, dataset_id)
-    try:
-        dataset = client.get_dataset(dataset_ref)
-        existing_location = str(dataset.location or "").upper()
-        requested_location = str(config.bigquery_location or "").upper()
-        if existing_location and requested_location and existing_location != requested_location:
-            raise ValueError(
-                f"Existing dataset {dataset_ref} is in {existing_location}, but "
-                f"BIGQUERY_LOCATION is {requested_location}."
-            )
-        return dataset
-    except NotFound:
-        if not config.bigquery_create_dataset:
-            raise RuntimeError(
-                f"BigQuery dataset {dataset_ref} does not exist. Create it first or set "
-                "BIGQUERY_CREATE_DATASET=true."
-            )
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = config.bigquery_location
-        dataset.description = "GA4 and Firebase reporting generated by the GA4 export workflow."
-        created = client.create_dataset(dataset)
-        print(f"Created BigQuery dataset: {created.full_dataset_id}")
-        return created
-
-
-def write_ndjson_records(file_handle, rows: list[list], field_map: dict[str, str], exported_at: str, export_run_id: str) -> int:
-    count = 0
-    for values in rows:
-        record = output_values_to_bigquery_record(
-            values,
-            field_map,
-            exported_at,
-            export_run_id,
-        )
-        file_handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-        file_handle.write("\n")
-        count += 1
-    return count
-
-
-def load_ndjson_file_to_bigquery(ndjson_path: str, row_count: int, field_map: dict[str, str]) -> str:
-    if row_count <= 0:
-        raise RuntimeError("No report rows were generated; BigQuery was not modified.")
-
-    client = get_bigquery_client()
-    ensure_bigquery_dataset(client)
-    table_name = validate_bigquery_identifier(config.bigquery_table, "BIGQUERY_TABLE")
-    table_id = f"{client.project}.{config.bigquery_dataset}.{table_name}"
-
-    write_disposition = str(config.bigquery_write_disposition or "WRITE_TRUNCATE").upper()
-    allowed = {"WRITE_TRUNCATE", "WRITE_APPEND", "WRITE_EMPTY"}
-    if write_disposition not in allowed:
-        raise ValueError(
-            f"BIGQUERY_WRITE_DISPOSITION must be one of {sorted(allowed)}. "
-            f"Current value: {write_disposition}"
-        )
-
-    job_config = bigquery.LoadJobConfig(
-        schema=build_bigquery_schema(field_map),
-        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        write_disposition=write_disposition,
-        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        ignore_unknown_values=False,
-        max_bad_records=0,
-        time_partitioning=bigquery.TimePartitioning(
-            type_=bigquery.TimePartitioningType.DAY,
-            field=field_map["Date"],
-        ),
-        clustering_fields=[
-            field_map["Package Name"],
-            field_map["GA4 Property ID"],
-        ],
-    )
-    if write_disposition == "WRITE_APPEND":
-        job_config.schema_update_options = [
-            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
-            bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION,
-        ]
-
-    file_size = os.path.getsize(ndjson_path)
-    print(
-        f"Loading {row_count:,} rows ({file_size / 1024 / 1024:.2f} MiB) into "
-        f"BigQuery table {table_id} using {write_disposition}..."
-    )
-    with open(ndjson_path, "rb") as source_file:
-        load_job = client.load_table_from_file(
-            source_file,
-            table_id,
-            job_config=job_config,
-            location=config.bigquery_location,
-            rewind=True,
-            size=file_size,
-        )
-        load_job.result()
-
-    table = client.get_table(table_id)
-    print(
-        f"BigQuery load complete: {table_id}; current table rows: "
-        f"{int(table.num_rows or 0):,}."
-    )
-    return table_id
-
-
-def list_accessible_ga4_property_summaries() -> list[dict]:
-    """List every GA4 property visible to the service account."""
-    base = str(config.ga4_admin_api_base).rstrip("/")
-    url = f"{base}/accountSummaries"
-    params = {"pageSize": 200}
-    properties: list[dict] = []
-
-    while True:
-        response = get_analytics_admin_session().get(url, params=params, timeout=30)
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"GA4 Admin accountSummaries error {response.status_code}: "
-                f"{response.text}"
-            )
-        payload = response.json()
-        for account in payload.get("accountSummaries", []) or []:
-            account_name = str(account.get("displayName", "")).strip()
-            for item in account.get("propertySummaries", []) or []:
-                property_resource = str(item.get("property", "")).strip()
-                property_id = property_resource.rsplit("/", 1)[-1]
-                if not property_id:
-                    continue
-                properties.append(
-                    {
-                        "property_id": property_id,
-                        "property_name": str(item.get("displayName", "")).strip(),
-                        "property_type": str(item.get("propertyType", "")).strip(),
-                        "account_name": account_name,
-                    }
-                )
-
-        token = str(payload.get("nextPageToken", "") or "").strip()
-        if not token:
-            break
-        params["pageToken"] = token
-
-    # Account summaries should already be unique, but keep the result stable.
-    deduped: dict[str, dict] = {}
-    for item in properties:
-        deduped[item["property_id"]] = item
-    return sorted(
-        deduped.values(),
-        key=lambda item: (item.get("property_name", "").lower(), item["property_id"]),
-    )
-
-
-def list_ga4_data_streams(property_id: str) -> list[dict]:
-    """List all data streams for one accessible GA4 property."""
-    base = str(config.ga4_admin_api_base).rstrip("/")
-    url = f"{base}/properties/{property_id}/dataStreams"
-    params = {"pageSize": 200}
-    streams: list[dict] = []
-
-    while True:
-        response = get_analytics_admin_session().get(url, params=params, timeout=30)
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"GA4 Admin dataStreams error {response.status_code}: "
-                f"{response.text}"
-            )
-        payload = response.json()
-        streams.extend(payload.get("dataStreams", []) or [])
-        token = str(payload.get("nextPageToken", "") or "").strip()
-        if not token:
-            break
-        params["pageToken"] = token
-
-    return streams
-
-
-def list_accessible_firebase_projects() -> list[dict]:
-    """List Firebase projects visible to the same service account."""
-    base = str(
-        getattr(
-            config,
-            "firebase_management_api_base",
-            "https://firebase.googleapis.com/v1beta1",
-        )
-    ).rstrip("/")
-    url = f"{base}/projects"
-    params = {"pageSize": 100}
-    projects: list[dict] = []
-
-    while True:
-        response = get_notification_api_session().get(url, params=params, timeout=30)
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Firebase projects.list error {response.status_code}: "
-                f"{response.text}"
-            )
-        payload = response.json()
-        projects.extend(payload.get("results", []) or [])
-        token = str(payload.get("nextPageToken", "") or "").strip()
-        if not token:
-            break
-        params["pageToken"] = token
-
-    return projects
-
-
-def build_accessible_firebase_app_indexes() -> tuple[dict[str, dict], dict[str, list[dict]]]:
-    """Index Firebase Android apps by Firebase App ID and package name."""
-    by_app_id: dict[str, dict] = {}
-    by_package: dict[str, list[dict]] = {}
-
-    try:
-        projects = list_accessible_firebase_projects()
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(
-            "FIREBASE DISCOVERY "
-            f"{status}: {error_text}. GA4 apps will still be processed, "
-            "but Firebase project details may be blank."
-        )
-        return by_app_id, by_package
-
-    for project in projects:
-        project_id = str(project.get("projectId", "") or "").strip()
-        project_number = str(project.get("projectNumber", "") or "").strip()
-        project_resource = str(project.get("name", "") or "").strip()
-        project_identifier = (
-            project_id
-            or project_number
-            or project_resource.rsplit("/", 1)[-1]
-        )
-        if not project_identifier:
-            continue
-
-        try:
-            android_apps = list_firebase_android_apps(project_identifier)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(
-                f"FIREBASE APP DISCOVERY {status} for {project_identifier}: "
-                f"{error_text}"
-            )
-            continue
-
-        for firebase_app in android_apps:
-            record = {
-                "project": project,
-                "app": firebase_app,
-            }
-            firebase_app_id = str(firebase_app.get("appId", "") or "").strip()
-            package_name = str(firebase_app.get("packageName", "") or "").strip()
-            if firebase_app_id:
-                by_app_id[firebase_app_id] = record
-            if package_name:
-                by_package.setdefault(package_name.lower(), []).append(record)
-
-    return by_app_id, by_package
-
-
-def discover_apps_from_service_account() -> list[AppConfig]:
-    """Discover every Android GA4 app the service account can read.
-
-    GA4 property and stream metadata come from the Analytics Admin API.
-    Firebase project/app metadata come from the Firebase Management API when
-    the same service account also has Firebase project access. Apps Config is
-    not used as the source of the app list.
-    """
-    firebase_by_app_id, firebase_by_package = build_accessible_firebase_app_indexes()
-    discovered: list[AppConfig] = []
-
-    for property_item in list_accessible_ga4_property_summaries():
-        property_id = property_item["property_id"]
-        property_name = property_item.get("property_name", "")
-        try:
-            streams = list_ga4_data_streams(property_id)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(
-                f"GA4 STREAM DISCOVERY {status} for {property_name} / "
-                f"{property_id}: {error_text}"
-            )
-            continue
-
-        for stream in streams:
-            android = stream.get("androidAppStreamData", {}) or {}
-            if not android:
-                continue
-
-            stream_resource = str(stream.get("name", "") or "").strip()
-            stream_id = stream_resource.rsplit("/", 1)[-1]
-            stream_name = str(stream.get("displayName", "") or "").strip()
-            firebase_app_id = str(android.get("firebaseAppId", "") or "").strip()
-            package_name = str(android.get("packageName", "") or "").strip()
-
-            firebase_record = firebase_by_app_id.get(firebase_app_id)
-            if firebase_record is None and package_name:
-                package_matches = firebase_by_package.get(package_name.lower(), [])
-                if len(package_matches) == 1:
-                    firebase_record = package_matches[0]
-
-            firebase_project_id = ""
-            firebase_project_name = ""
-            firebase_display_name = ""
-            if firebase_record:
-                project = firebase_record.get("project", {}) or {}
-                firebase_app = firebase_record.get("app", {}) or {}
-                firebase_project_id = str(
-                    project.get("projectId", "")
-                    or firebase_app.get("projectId", "")
-                    or ""
-                ).strip()
-                firebase_project_name = str(project.get("displayName", "") or "").strip()
-                firebase_display_name = str(firebase_app.get("displayName", "") or "").strip()
-                firebase_app_id = firebase_app_id or str(firebase_app.get("appId", "") or "").strip()
-                package_name = package_name or str(firebase_app.get("packageName", "") or "").strip()
-
-            app_name = stream_name or firebase_display_name or property_name or package_name
-            discovered.append(
-                AppConfig(
-                    app_name=app_name,
-                    property_id=property_id,
-                    firebase_project_id=firebase_project_id,
-                    firebase_project_name=firebase_project_name,
-                    firebase_app_id=firebase_app_id,
-                    time_capping_parameter=config.time_capping_parameter,
-                    iap_screen_parameter=config.iap_screen_parameter,
-                    app_open_event_names=config.app_open_event_names,
-                    home_event_names=config.home_event_names,
-                    feature_event_names=config.feature_event_names,
-                    ga4_stream_id=stream_id,
-                    package_name=package_name,
-                )
-            )
-
-    # Avoid duplicates and make processing order deterministic.
-    unique: dict[tuple[str, str, str, str], AppConfig] = {}
-    for app in discovered:
-        key = (
-            app.property_id,
-            app.ga4_stream_id,
-            app.firebase_app_id,
-            app.package_name,
-        )
-        unique[key] = app
-
-    apps = sorted(
-        unique.values(),
-        key=lambda app: (app.app_name.lower(), app.property_id, app.ga4_stream_id),
-    )
-    if not apps:
-        raise SystemExit(
-            "No accessible Android GA4 data streams were found for this service account."
-        )
-    return apps
-
-
-def resolve_ga4_date(value: str) -> str:
-    value = str(value).strip()
-    today = datetime.now(ZoneInfo(config.timezone)).date()
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        return value
-    if value.lower() == "today":
-        return today.isoformat()
-    if value.lower() == "yesterday":
-        return (today - timedelta(days=1)).isoformat()
-    match = re.fullmatch(r"(\d+)daysAgo", value, re.IGNORECASE)
-    if match:
-        return (today - timedelta(days=int(match.group(1)))).isoformat()
-    return value
-
-
-def get_report_dates() -> list[str]:
-    start = datetime.fromisoformat(resolve_ga4_date(config.start_date)).date()
-    end = datetime.fromisoformat(resolve_ga4_date(config.end_date)).date()
-    if start > end:
-        raise ValueError(f"START_DATE must be on or before END_DATE. Current: {start} to {end}")
-    return [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
-
-
-def ga4_date_to_iso(value: str) -> str:
-    value = str(value or "").strip()
-    if re.fullmatch(r"\d{8}", value):
-        return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
-    return value
-
-
-def split_csv(value: str) -> list[str]:
-    seen = set()
-    result = []
-    for item in str(value or "").split(","):
-        item = item.strip()
-        if item and item not in seen:
-            result.append(item)
-            seen.add(item)
-    return result
-
-
-def to_number(value):
-    if value in {None, ""}:
-        return 0
-    try:
-        number = float(value)
-        return int(number) if number.is_integer() else round(number, 2)
-    except Exception:
-        return value
-
-
-def to_float(value) -> float:
-    if value in {None, ""}:
-        return 0.0
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def percent(value) -> str:
-    try:
-        number = float(value)
-        if number <= 1:
-            number *= 100
-        return f"{round(number, 2)}%"
-    except Exception:
-        return ""
-
-
-def rate(numerator, denominator) -> str:
-    denominator = to_float(denominator)
-    if denominator == 0:
-        return "0%"
-    return f"{round((to_float(numerator) / denominator) * 100, 2)}%"
-
-
-def format_seconds(seconds_value) -> str:
-    total = int(round(to_float(seconds_value)))
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    seconds = total % 60
-    if hours:
-        return f"{hours}h {minutes}m {seconds}s"
-    return f"{minutes}m {seconds}s"
-
-
-def classify_api_error(error) -> tuple[str, str]:
-    text = str(error)
-    lower = text.lower()
-    if any(term in lower for term in ["service_disabled", "has not been enabled", "api disabled", "api not enabled"]):
-        return "API NOT ENABLED", text
-    if any(term in lower for term in ["403", "permission denied", "access denied", "insufficient permissions"]):
-        return "NO ACCESS", text
-    if any(term in lower for term in ["404", "not found", "invalid property"]):
-        return "INVALID PROPERTY ID", text
-    return "ERROR", text
-
-
-def get_analytics_admin_session():
-    global analytics_admin_session
-    if analytics_admin_session is None:
-        analytics_admin_session = AuthorizedSession(credentials)
-    return analytics_admin_session
-
-
-def fetch_ga4_package_name(app: AppConfig) -> str:
-    if app.package_name:
-        return app.package_name
-    if not config.fetch_package_name:
-        return ""
-    cache_key = f"{app.property_id}|{app.firebase_app_id}"
-    if cache_key in package_name_cache:
-        return package_name_cache[cache_key]
-    try:
-        url = f"{config.ga4_admin_api_base}/properties/{app.property_id}/dataStreams"
-        params = {"pageSize": 200}
-        streams = []
-        while True:
-            response = get_analytics_admin_session().get(url, params=params, timeout=30)
-            if response.status_code >= 400:
-                raise RuntimeError(f"GA4 Admin API error {response.status_code}: {response.text}")
-            payload = response.json()
-            streams.extend(payload.get("dataStreams", []) or [])
-            token = payload.get("nextPageToken", "")
-            if not token:
-                break
-            params["pageToken"] = token
-        android_streams = []
-        for stream in streams:
-            android = stream.get("androidAppStreamData", {}) or {}
-            package_name = str(android.get("packageName", "")).strip()
-            firebase_app_id = str(android.get("firebaseAppId", "")).strip()
-            if package_name:
-                android_streams.append((package_name, firebase_app_id))
-        if app.firebase_app_id:
-            for package_name, firebase_app_id in android_streams:
-                if firebase_app_id == app.firebase_app_id:
-                    package_name_cache[cache_key] = package_name
-                    return package_name
-        package_names = []
-        seen = set()
-        for package_name, _ in android_streams:
-            if package_name not in seen:
-                package_names.append(package_name)
-                seen.add(package_name)
-        result = ", ".join(package_names)
-        package_name_cache[cache_key] = result
-        return result
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"PACKAGE NAME {status} for {app.app_name} / {app.property_id}: {error_text}")
-        package_name_cache[cache_key] = ""
-        return ""
-
-
-def exact_filter(field_name: str, value: str) -> FilterExpression:
-    return FilterExpression(
-        filter=Filter(
-            field_name=field_name,
-            string_filter=Filter.StringFilter(
-                match_type=Filter.StringFilter.MatchType.EXACT,
-                value=value,
-                case_sensitive=False,
-            ),
-        )
-    )
-
-
-def contains_filter(field_name: str, value: str) -> FilterExpression:
-    return FilterExpression(
-        filter=Filter(
-            field_name=field_name,
-            string_filter=Filter.StringFilter(
-                match_type=Filter.StringFilter.MatchType.CONTAINS,
-                value=value,
-                case_sensitive=False,
-            ),
-        )
-    )
-
-
-def in_list_filter(field_name: str, values: list[str]) -> FilterExpression:
-    return FilterExpression(
-        filter=Filter(
-            field_name=field_name,
-            in_list_filter=Filter.InListFilter(values=values, case_sensitive=False),
-        )
-    )
-
-
-def and_filter(expressions: list[FilterExpression]) -> FilterExpression:
-    return FilterExpression(and_group=FilterExpressionList(expressions=expressions))
-
-
-def report_dimension_filter_kwargs(
-    app: AppConfig,
-    base_filter: FilterExpression | None = None,
-) -> dict:
-    """Return RunReportRequest kwargs scoped to the discovered GA4 stream."""
-    expressions: list[FilterExpression] = []
-    if app.ga4_stream_id:
-        expressions.append(exact_filter("streamId", app.ga4_stream_id))
-    if base_filter is not None:
-        expressions.append(base_filter)
-    if not expressions:
-        return {}
-    expression = expressions[0] if len(expressions) == 1 else and_filter(expressions)
-    return {"dimension_filter": expression}
-
-
-HOME_SCREEN_DIMENSIONS = (
-    "unifiedScreenName",
-    "unifiedScreenClass",
-    "unifiedPagePathScreen",
-)
-
-HOME_SCREEN_POSITIVE_TERMS = (
-    "home",
-    "main",
-    "dashboard",
-    "landing",
-    "launcher",
-    "feed",
-)
-
-HOME_SCREEN_TRANSIENT_TERMS = (
-    "splash",
-    "intro",
-    "onboard",
-    "tutorial",
-    "permission",
-    "consent",
-    "language",
-    "login",
-    "signin",
-    "sign_in",
-    "register",
-    "paywall",
-    "premium",
-    "purchase",
-    "subscription",
-    "subscribe",
-    "offer",
-    "interstitial",
-    "rewarded",
-    "adactivity",
-    "ad_activity",
-)
-
-
-def _valid_screen_value(value: str) -> bool:
-    text = str(value or "").strip()
-    return bool(text and text.lower() not in {"(not set)", "not set", "unknown", "null"})
-
-
-def _home_screen_score(value: str, active_users, views, rank: int) -> float:
-    """Score a screen as the likely post-launch home destination.
-
-    Usage remains the main signal. Name-based terms only help avoid selecting
-    transient splash, onboarding, permission, ad, or paywall screens.
-    """
-    text = str(value or "").strip().lower()
-    score = to_float(active_users) * 1000.0 + to_float(views)
-    score -= rank * 0.01
-    if any(term in text for term in HOME_SCREEN_POSITIVE_TERMS):
-        score += max(to_float(active_users), 1.0) * 400.0
-    if any(term in text for term in HOME_SCREEN_TRANSIENT_TERMS):
-        score -= max(to_float(active_users), 1.0) * 700.0
-    return score
-
-
-def apply_home_screen_override(app: AppConfig) -> bool:
-    """Apply an optional per-app home-screen override from JSON config.
-
-    The JSON object can be keyed by package name, Firebase App ID, GA4 stream
-    ID, GA4 property ID, or discovered app name. Each value must contain
-    ``field`` and ``value``. Example::
-
-        {
-          "com.example.app": {
-            "field": "unifiedScreenName",
-            "value": "HomeScreen"
-          }
-        }
-    """
-    raw = str(config.home_screen_overrides_json or "{}").strip()
-    try:
-        overrides = json.loads(raw)
-    except json.JSONDecodeError as error:
-        print(f"Invalid HOME_SCREEN_OVERRIDES_JSON: {error}")
-        return False
-
-    if not isinstance(overrides, dict):
-        print("HOME_SCREEN_OVERRIDES_JSON must be a JSON object.")
-        return False
-
-    lookup_keys = [
-        app.package_name,
-        app.firebase_app_id,
-        app.ga4_stream_id,
-        app.property_id,
-        app.app_name,
-    ]
-    override = None
-    matched_key = ""
-    for key in lookup_keys:
-        key = str(key or "").strip()
-        if key and key in overrides:
-            override = overrides[key]
-            matched_key = key
-            break
-
-    if not isinstance(override, dict):
-        return False
-
-    field = str(override.get("field", "") or "").strip()
-    value = str(override.get("value", "") or "").strip()
-    if field not in HOME_SCREEN_DIMENSIONS or not _valid_screen_value(value):
-        print(
-            f"Ignoring invalid home-screen override for {matched_key}. "
-            f"field must be one of {HOME_SCREEN_DIMENSIONS} and value cannot be empty."
-        )
-        return False
-
-    app.screen_field = field
-    app.home_screen_name = value
-    app.home_detection_method = f"HOME_SCREEN_OVERRIDES_JSON override ({matched_key})"
-    print(
-        f"Applied home-screen override for {app.app_name}: "
-        f"{app.screen_field} = {app.home_screen_name}"
-    )
-    return True
-
-
-def discover_home_screen(app: AppConfig) -> tuple[str, str, str]:
-    """Detect the best available GA4 screen dimension and likely home screen.
-
-    No Activity name or screen field is hardcoded. The function queries valid
-    GA4 Data API screen dimensions, scopes the report to the discovered stream,
-    and picks the strongest non-transient screen. When a global HOME_EVENT_NAMES
-    override is configured, this function is not needed by the funnel.
-    """
-    candidates: list[dict] = []
-
-    for dimension_name in HOME_SCREEN_DIMENSIONS:
-        try:
-            request = RunReportRequest(
-                property=f"properties/{app.property_id}",
-                date_ranges=[
-                    DateRange(
-                        start_date=config.start_date,
-                        end_date=config.end_date,
-                    )
-                ],
-                dimensions=[Dimension(name=dimension_name)],
-                metrics=[Metric(name="activeUsers"), Metric(name="screenPageViews")],
-                **report_dimension_filter_kwargs(
-                    app,
-                    exact_filter("eventName", "screen_view"),
-                ),
-                order_bys=[metric_order("activeUsers"), metric_order("screenPageViews")],
-                keep_empty_rows=False,
-                limit=100,
-            )
-            response = beta_client.run_report(request)
-            rows = parse_response_rows(response)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(
-                f"HOME SCREEN DISCOVERY {dimension_name} {status} for "
-                f"{app.app_name}: {error_text}"
-            )
-            continue
-
-        dimension_candidates = []
-        for rank, row in enumerate(rows):
-            value = str(row.get(dimension_name, "") or "").strip()
-            if not _valid_screen_value(value):
-                continue
-            active_users = to_float(row.get("activeUsers", 0))
-            views = to_float(row.get("screenPageViews", 0))
-            dimension_candidates.append(
-                {
-                    "field": dimension_name,
-                    "value": value,
-                    "active_users": active_users,
-                    "views": views,
-                    "score": _home_screen_score(value, active_users, views, rank),
-                    "rank": rank,
-                }
-            )
-
-        if dimension_candidates:
-            candidates.extend(dimension_candidates)
-
-    if not candidates:
-        app.home_screen_name = ""
-        app.screen_field = ""
-        app.home_detection_method = "No screen_view data returned"
-        print(f"No home screen could be detected for {app.app_name}.")
-        return "", "", app.home_detection_method
-
-    # Prefer an explicit screen name when its usage is close to the best class;
-    # otherwise choose the highest scored valid candidate across all dimensions.
-    candidates.sort(
-        key=lambda item: (
-            item["score"],
-            item["active_users"],
-            item["views"],
-            -HOME_SCREEN_DIMENSIONS.index(item["field"]),
-        ),
-        reverse=True,
-    )
-    selected = candidates[0]
-
-    app.home_screen_name = selected["value"]
-    app.screen_field = selected["field"]
-    app.home_detection_method = (
-        "Auto-detected from screen_view using activeUsers and screenPageViews"
-    )
-    print(
-        f"Detected home screen for {app.app_name}: "
-        f"{app.screen_field} = {app.home_screen_name} "
-        f"(active users={to_number(selected['active_users'])}, "
-        f"views={to_number(selected['views'])})"
-    )
-    return app.home_screen_name, app.screen_field, app.home_detection_method
-
-
-def date_order() -> OrderBy:
-    return OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))
-
-
-def metric_order(metric_name: str, desc: bool = True) -> OrderBy:
-    return OrderBy(metric=OrderBy.MetricOrderBy(metric_name=metric_name), desc=desc)
-
-
-def row_to_dict(response_row, dimension_headers: list[str], metric_headers: list[str]) -> dict:
-    data = {}
-    for index, value in enumerate(response_row.dimension_values):
-        if index < len(dimension_headers):
-            data[dimension_headers[index]] = value.value
-    for index, value in enumerate(response_row.metric_values):
-        if index < len(metric_headers):
-            data[metric_headers[index]] = value.value
-    return data
-
-
-def parse_response_rows(response) -> list[dict]:
-    dimension_headers = [header.name for header in response.dimension_headers]
-    metric_headers = [header.name for header in response.metric_headers]
-    return [row_to_dict(row, dimension_headers, metric_headers) for row in response.rows]
-
-
-def run_time_analysis_report(app: AppConfig) -> dict[str, list[dict]]:
-    """Return session-time metrics broken down by date and country."""
-    by_date: dict[str, list[dict]] = {}
-    page_size = 100000
-    offset = 0
-
-    while True:
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-            dimensions=[Dimension(name="date"), Dimension(name="country")],
-            metrics=[
-                Metric(name="activeUsers"),
-                Metric(name="newUsers"),
-                Metric(name="sessions"),
-                Metric(name="engagedSessions"),
-                Metric(name="averageSessionDuration"),
-                Metric(name="userEngagementDuration"),
-                Metric(name="engagementRate"),
-            ],
-            order_bys=[date_order(), metric_order("activeUsers")],
-            **report_dimension_filter_kwargs(app),
-            keep_empty_rows=False,
-            limit=page_size,
-            offset=offset,
-        )
-        response = beta_client.run_report(request)
-        page_rows = parse_response_rows(response)
-        if not page_rows:
-            break
-
-        for row in page_rows:
-            report_date = ga4_date_to_iso(row.get("date", ""))
-            active_users = to_number(row.get("activeUsers", 0))
-            sessions = to_number(row.get("sessions", 0))
-            session_seconds = to_float(row.get("averageSessionDuration", 0))
-            engagement_seconds = to_float(row.get("userEngagementDuration", 0))
-            by_date.setdefault(report_date, []).append(
-                {
-                    "Country": row.get("country", "") or "(not set)",
-                    "Active Users": active_users,
-                    "New Users": to_number(row.get("newUsers", 0)),
-                    "Sessions": sessions,
-                    "Engaged Sessions": to_number(row.get("engagedSessions", 0)),
-                    "Avg Session Duration": format_seconds(session_seconds),
-                    "Total Engagement Time": format_seconds(engagement_seconds),
-                    "Sessions Per Active User": round(
-                        to_float(sessions) / to_float(active_users),
-                        2,
-                    ) if to_float(active_users) else 0,
-                    "Engagement Rate": percent(row.get("engagementRate", 0)),
-                }
-            )
-
-        if len(page_rows) < page_size:
-            break
-        offset += len(page_rows)
-
-    return by_date
-
-
-def run_event_report(app: AppConfig, event_names: list[str]) -> dict[tuple[str, str], dict]:
-    if not event_names:
-        return {}
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-        dimensions=[Dimension(name="date"), Dimension(name="eventName")],
-        metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-        **report_dimension_filter_kwargs(
-            app,
-            in_list_filter("eventName", event_names),
-        ),
-        order_bys=[date_order()],
-        keep_empty_rows=False,
-        limit=100000,
-    )
-    response = beta_client.run_report(request)
-    result = {}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        event_name = row.get("eventName", "")
-        result[(report_date, event_name)] = {
-            "active_users": to_number(row.get("activeUsers", 0)),
-            "event_count": to_number(row.get("eventCount", 0)),
-        }
-    return result
-
-
-def run_home_screen_report(app: AppConfig) -> dict[str, dict]:
-    if not app.screen_field or not app.home_screen_name:
-        return {}
-
-    request = RunReportRequest(
-        property=f"properties/{app.property_id}",
-        date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-        dimensions=[Dimension(name="date")],
-        metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
-        **report_dimension_filter_kwargs(
-            app,
-            and_filter(
-                [
-                    exact_filter("eventName", "screen_view"),
-                    exact_filter(app.screen_field, app.home_screen_name),
-                ]
-            ),
-        ),
-        order_bys=[date_order()],
-        keep_empty_rows=True,
-        limit=100000,
-    )
-    response = beta_client.run_report(request)
-    result = {}
-    for row in parse_response_rows(response):
-        report_date = ga4_date_to_iso(row.get("date", ""))
-        result[report_date] = {
-            "active_users": to_number(row.get("activeUsers", 0)),
-            "event_count": to_number(row.get("eventCount", 0)),
-        }
-    return result
-
-
-def is_retention_target_ready(
-    cohort_date: str,
-    day_offset: int,
-    observation_end_date: str,
-) -> bool:
-    """Return True when the requested retention day is inside the report window."""
-    cohort_day = datetime.fromisoformat(cohort_date).date()
-    target_day = cohort_day + timedelta(days=day_offset)
-    report_end_day = datetime.fromisoformat(observation_end_date).date()
-    return target_day <= report_end_day
-
-
-def parse_cohort_day(value) -> int:
-    text = str(value or "0")
-    digits = re.sub(r"[^0-9]", "", text)
-    return int(digits or 0)
-
-
-RETENTION_DAY_OFFSETS = (1, 3, 7, 30)
-
-
-def format_retention_fraction(value) -> str:
-    """Format a GA4 cohort retention fraction with two decimal places."""
-    return f"{to_float(value) * 100:.2f}%"
-
-
-def run_retention_report(
-    app: AppConfig,
-    report_dates: list[str],
-) -> dict[str, list[dict]]:
-    """Return exact daily first-session cohort retention by acquisition date and country."""
-    retention_by_date: dict[str, list[dict]] = {
-        cohort_date: [] for cohort_date in report_dates
-    }
-    if not report_dates:
-        return retention_by_date
-
-    observation_end_date = max(report_dates)
-
-    # Query each acquisition date as a separate one-day cohort so every output
-    # row maps directly to the matching daily row in GA4 Cohort Exploration.
-    for cohort_date in report_dates:
-        country_data: dict[str, dict] = {}
-        page_size = 100000
-        offset = 0
-
-        while True:
-            request = RunReportRequest(
-                property=f"properties/{app.property_id}",
-                dimensions=[
-                    Dimension(name="cohort"),
-                    Dimension(name="cohortNthDay"),
-                    Dimension(name="country"),
-                ],
-                metrics=[
-                    Metric(name="cohortActiveUsers"),
-                    Metric(name="cohortTotalUsers"),
-                ],
-                cohort_spec=CohortSpec(
-                    cohorts=[
-                        Cohort(
-                            name=cohort_date,
-                            dimension="firstSessionDate",
-                            date_range=DateRange(
-                                start_date=cohort_date,
-                                end_date=cohort_date,
-                            ),
-                        )
-                    ],
-                    cohorts_range=CohortsRange(
-                        granularity=CohortsRange.Granularity.DAILY,
-                        start_offset=0,
-                        end_offset=max(RETENTION_DAY_OFFSETS),
-                    ),
-                ),
-                **report_dimension_filter_kwargs(app),
-                keep_empty_rows=True,
-                limit=page_size,
-                offset=offset,
-            )
-
-            response = beta_client.run_report(request)
-            page_rows = parse_response_rows(response)
-            if not page_rows:
-                break
-
-            for row in page_rows:
-                returned_cohort = str(row.get("cohort", "") or "").strip()
-                if returned_cohort not in {cohort_date, "cohort_0"}:
-                    continue
-
-                country = str(row.get("country", "") or "").strip() or "(not set)"
-                day_offset = parse_cohort_day(row.get("cohortNthDay", 0))
-                active_users = to_float(row.get("cohortActiveUsers", 0))
-                total_users = to_float(row.get("cohortTotalUsers", 0))
-                country_item = country_data.setdefault(
-                    country,
-                    {
-                        "cohort_total_users": 0.0,
-                        "days": {},
-                    },
-                )
-
-                # GA4 Cohort Exploration uses one fixed cohort denominator for
-                # every retention day. Capture it only from the Day 0 row for
-                # this acquisition-date and country cohort.
-                if day_offset == 0 and total_users > 0:
-                    country_item["cohort_total_users"] = total_users
-
-                country_item["days"][day_offset] = {
-                    "active_users": active_users,
-                    "total_users": total_users,
-                }
-
-            if len(page_rows) < page_size:
-                break
-            offset += len(page_rows)
-
-        sorted_countries = sorted(
-            country_data.items(),
-            key=lambda item: (
-                -to_float(item[1].get("cohort_total_users", 0)),
-                item[0].lower(),
-            ),
-        )
-
-        for country, country_item in sorted_countries:
-            cohort_total_users = to_float(country_item.get("cohort_total_users", 0))
-            if cohort_total_users <= 0:
-                continue
-
-            output_item = {
-                "Cohort Date": cohort_date,
-                "Country": country,
-            }
-            day_data = country_item.get("days", {}) or {}
-
-            for day_offset in RETENTION_DAY_OFFSETS:
-                key = f"D{day_offset} Retention"
-                if not is_retention_target_ready(
-                    cohort_date,
-                    day_offset,
-                    observation_end_date,
-                ):
-                    output_item[key] = "Not available"
-                    continue
-
-                metrics = day_data.get(day_offset, {}) or {}
-                numerator = to_float(metrics.get("active_users", 0))
-                output_item[key] = format_retention_fraction(
-                    numerator / cohort_total_users
-                )
-
-            retention_by_date[cohort_date].append(output_item)
-
-    return retention_by_date
-
-
-def _append_unique(values: list[str], value) -> None:
-    text = str(value or "").strip()
-    if text and text not in values:
-        values.append(text)
-
-
-def _extract_filter_values(filter_object: dict) -> list[str]:
-    values: list[str] = []
-    string_filter = filter_object.get("stringFilter", {}) or {}
-    _append_unique(values, string_filter.get("value", ""))
-    in_list_filter = filter_object.get("inListFilter", {}) or {}
-    for item in in_list_filter.get("values", []) or []:
-        _append_unique(values, item)
-    return values
-
-
-def _collect_audience_definition_fields(
-    node,
-    event_names: list[str],
-    countries: list[str],
-) -> None:
-    """Recursively collect audience-condition events and country values."""
-    if isinstance(node, list):
-        for item in node:
-            _collect_audience_definition_fields(item, event_names, countries)
-        return
-    if not isinstance(node, dict):
-        return
-
-    event_filter = node.get("eventFilter")
-    if isinstance(event_filter, dict):
-        _append_unique(event_names, event_filter.get("eventName", ""))
-
-    dimension_filter = node.get("dimensionOrMetricFilter")
-    if isinstance(dimension_filter, dict):
-        field_name = str(dimension_filter.get("fieldName", "")).strip().lower()
-        if field_name in {"country", "countryid", "country_id"}:
-            for value in _extract_filter_values(dimension_filter):
-                _append_unique(countries, value)
-
-    for value in node.values():
-        _collect_audience_definition_fields(value, event_names, countries)
-
-
-def fetch_ga4_audience_definitions(app: AppConfig) -> dict[str, dict]:
-    """List active audiences from GA4 Admin > Data display > Audiences."""
-    property_id = str(app.property_id).strip()
-    if property_id in ga4_audience_definition_cache:
-        return ga4_audience_definition_cache[property_id]
-
-    definitions: dict[str, dict] = {}
-    try:
-        url = (
-            f"{config.ga4_admin_audience_api_base}/properties/"
-            f"{property_id}/audiences"
-        )
-        params = {"pageSize": 200}
-        while True:
-            response = get_analytics_admin_session().get(url, params=params, timeout=30)
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"GA4 Audience Admin API error {response.status_code}: "
-                    f"{response.text}"
-                )
-            payload = response.json()
-            for audience in payload.get("audiences", []) or []:
-                resource_name = str(audience.get("name", "")).strip()
-                display_name = str(audience.get("displayName", "")).strip()
-                if not resource_name and not display_name:
-                    continue
-
-                event_names: list[str] = []
-                countries: list[str] = []
-                _collect_audience_definition_fields(
-                    audience.get("filterClauses", []) or [],
-                    event_names,
-                    countries,
-                )
-
-                # Include the optional GA4 audience-trigger event as well.
-                event_trigger = audience.get("eventTrigger", {}) or {}
-                _append_unique(event_names, event_trigger.get("eventName", ""))
-
-                definition = {
-                    "resource_name": resource_name,
-                    "display_name": display_name,
-                    "description": str(audience.get("description", "")).strip(),
-                    "create_time": str(audience.get("createTime", "")).strip(),
-                    "events_name": ", ".join(event_names),
-                    "countries": ", ".join(countries),
-                }
-                definitions[resource_name or display_name] = definition
-
-            token = str(payload.get("nextPageToken", "")).strip()
-            if not token:
-                break
-            params["pageToken"] = token
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(
-            f"AUDIENCE ADMIN {status} for {app.app_name} / "
-            f"{app.property_id}: {error_text}"
-        )
-
-    ga4_audience_definition_cache[property_id] = definitions
-    return definitions
-
-
-def run_audience_report(app: AppConfig, report_dates: list[str]) -> dict[str, list[dict]]:
-    """Return the audiences shown in GA4 Admin for the selected date range.
-
-    The active audience list, configured event conditions, and configured
-    country conditions come from the GA4 Admin API. Total_Users is queried once
-    for the complete START_DATE-to-END_DATE range without date or country
-    breakdowns so it matches the range-level Total users value shown in the
-    Admin audience management table.
-    """
-    definitions = fetch_ga4_audience_definitions(app)
-    by_date: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    if not definitions:
-        return by_date
-
-    definitions_by_resource = {
-        str(item.get("resource_name", "")).strip(): item
-        for item in definitions.values()
-        if str(item.get("resource_name", "")).strip()
-    }
-    definitions_by_name = {
-        str(item.get("display_name", "")).strip(): item
-        for item in definitions.values()
-        if str(item.get("display_name", "")).strip()
-    }
-
-    totals_by_key: dict[str, float] = {}
-    page_size = 100000
-    offset = 0
-
-    while True:
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-            dimensions=[
-                Dimension(name="audienceResourceName"),
-                Dimension(name="audienceName"),
-            ],
-            metrics=[Metric(name="totalUsers")],
-            **report_dimension_filter_kwargs(app),
-            order_bys=[metric_order("totalUsers")],
-            keep_empty_rows=False,
-            limit=page_size,
-            offset=offset,
-        )
-        response = beta_client.run_report(request)
-        page_rows = parse_response_rows(response)
-        if not page_rows:
-            break
-
-        for row in page_rows:
-            resource_name = str(row.get("audienceResourceName", "")).strip()
-            reported_name = str(row.get("audienceName", "")).strip()
-            if reported_name in {"", "(not set)"}:
-                continue
-
-            # Only include audiences currently visible in Admin > Data display
-            # > Audiences. This excludes archived or historical audience rows.
-            definition = definitions_by_resource.get(resource_name)
-            if definition is None:
-                definition = definitions_by_name.get(reported_name)
-            if definition is None:
-                continue
-
-            key = (
-                str(definition.get("resource_name", "")).strip()
-                or str(definition.get("display_name", "")).strip()
-            )
-            totals_by_key[key] = totals_by_key.get(key, 0.0) + to_float(
-                row.get("totalUsers", 0)
-            )
-
-        if len(page_rows) < page_size:
-            break
-        offset += len(page_rows)
-
-    summary_rows: list[dict] = []
-    for definition in definitions.values():
-        audience_name = str(definition.get("display_name", "")).strip()
-        if not audience_name:
-            continue
-
-        key = (
-            str(definition.get("resource_name", "")).strip()
-            or audience_name
-        )
-        summary_rows.append(
-            {
-                "Audien Name": audience_name,
-                "Events Name": definition.get("events_name", ""),
-                "Countries": definition.get("countries", ""),
-                "Total_Users": to_number(totals_by_key.get(key, 0)),
-                "_create_time": definition.get("create_time", ""),
-            }
-        )
-
-    # The screenshot is sorted by Created On descending. Keep the same order,
-    # while using the audience name as a deterministic fallback.
-    summary_rows.sort(
-        key=lambda item: (
-            str(item.get("_create_time", "")),
-            str(item.get("Audien Name", "")).lower(),
-        ),
-        reverse=True,
-    )
-    for item in summary_rows:
-        item.pop("_create_time", None)
-
-    # The merged sheet is date-keyed. Repeat the same range-level Admin audience
-    # rows in each date block so the existing sheet structure remains stable.
-    for report_date in report_dates:
-        by_date[report_date] = [dict(item) for item in summary_rows]
-
-    return by_date
-
-
-def get_personalized_ux_dimensions(app: AppConfig) -> list[tuple[str, str]]:
-    # Reuse the dimension that successfully returned screen_view data during
-    # per-app home-screen detection. This avoids assuming one universal screen
-    # field such as unifiedPagePathScreen across every app.
-    screen_dimension = app.screen_field or "unifiedScreenClass"
-    return [
-        ("Country", "country"),
-        ("Language", "language"),
-        ("Device Category", "deviceCategory"),
-        ("Operating System", "operatingSystem"),
-        ("App Version", "appVersion"),
-        ("First User Medium", "firstUserMedium"),
-        ("Top Screens / Screen Class", screen_dimension),
-    ]
-
-
-def run_dimension_session_report(app: AppConfig, label: str, dimension_name: str, report_dates: list[str]) -> dict[str, list[dict]]:
-    """Return the top dimension values independently for every report date.
-
-    The old implementation used one small global API limit. Because results are
-    ordered by date, high-cardinality dimensions such as country and language
-    used the entire limit on the first dates, making later dates look trimmed.
-
-    This version reads the result in large pages. Normally it is still one API
-    call; extra calls occur only when the response contains more than one page.
-    """
-    by_date = {report_date: [] for report_date in report_dates}
-    page_size = 100000
-    offset = 0
-
-    while True:
-        request = RunReportRequest(
-            property=f"properties/{app.property_id}",
-            date_ranges=[DateRange(start_date=config.start_date, end_date=config.end_date)],
-            dimensions=[Dimension(name="date"), Dimension(name=dimension_name)],
-            metrics=[
-                Metric(name="activeUsers"),
-                Metric(name="sessions"),
-                Metric(name="averageSessionDuration"),
-                Metric(name="engagementRate"),
-            ],
-            order_bys=[date_order(), metric_order("activeUsers")],
-            **report_dimension_filter_kwargs(app),
-            limit=page_size,
-            offset=offset,
-        )
-        response = beta_client.run_report(request)
-        page_rows = parse_response_rows(response)
-
-        if not page_rows:
-            break
-
-        for row in page_rows:
-            report_date = ga4_date_to_iso(row.get("date", ""))
-            value = row.get(dimension_name, "") or "(not set)"
-            if report_date in by_date and len(by_date[report_date]) < max(config.personalized_top_n, 1):
-                by_date[report_date].append(
-                    {
-                        "label": label,
-                        "value": value,
-                        "active": to_number(row.get("activeUsers", 0)),
-                        "sessions": to_number(row.get("sessions", 0)),
-                        "avg": format_seconds(row.get("averageSessionDuration", 0)),
-                        "engagement": percent(row.get("engagementRate", 0)),
-                    }
-                )
-
-        offset += len(page_rows)
-        total_rows = int(getattr(response, "row_count", 0) or 0)
-        if len(page_rows) < page_size or (total_rows and offset >= total_rows):
-            break
-
-    missing_dates = [date for date, items in by_date.items() if not items]
-    if missing_dates:
-        print(f"PERSONALIZED UX {label}: no returned rows for dates {missing_dates}")
-
-    return by_date
-
-
-def run_personalized_ux(app: AppConfig, report_dates: list[str]) -> dict[str, dict[str, list[dict]]]:
-    """Return structured top values for each personalized dimension and date."""
-    result = {report_date: {} for report_date in report_dates}
-    for label, dimension_name in get_personalized_ux_dimensions(app):
-        try:
-            by_date = run_dimension_session_report(app, label, dimension_name, report_dates)
-            for report_date in report_dates:
-                result[report_date][label] = by_date.get(report_date, [])[: max(config.personalized_top_n, 1)]
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(f"PERSONALIZED UX {label} {status} for {app.app_name}: {error_text}")
-            for report_date in report_dates:
-                result[report_date][label] = []
-    return result
-
-
-def get_remote_config_session():
-    global remote_config_session
-    if remote_config_session is None:
-        remote_config_session = AuthorizedSession(credentials)
-    return remote_config_session
-
-
-def get_firebase_remote_config_template(firebase_project_id: str) -> dict:
-    project_id = str(firebase_project_id or "").strip()
-    if not project_id:
-        raise ValueError("Firebase Project ID could not be discovered for this app.")
-    if project_id in remote_config_template_cache:
-        return remote_config_template_cache[project_id]
-    project_path = f"projects/{project_id}"
-    url = f"{config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
-    params = {}
-    namespace = str(config.remote_config_namespace or "").strip()
-    if namespace:
-        params["name"] = f"{project_path}/namespaces/{namespace}/remoteConfig"
-    response = get_remote_config_session().get(
-        url,
-        params=params,
-        headers={"Accept-Encoding": "gzip"},
-        timeout=config.firebase_remote_config_timeout,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Firebase Remote Config API error {response.status_code}: {response.text}")
-    template = response.json()
-    remote_config_template_cache[project_id] = template
-    return template
-
-
-def iter_remote_config_parameters(template: dict):
-    for key, parameter in (template.get("parameters", {}) or {}).items():
-        yield key, parameter, ""
-    for group_name, group_data in (template.get("parameterGroups", {}) or {}).items():
-        for key, parameter in (group_data.get("parameters", {}) or {}).items():
-            yield key, parameter, group_name
-
-
-def format_remote_config_value(value_object) -> str:
-    if value_object in [None, ""]:
-        return ""
-    if isinstance(value_object, dict):
-        if "value" in value_object:
-            return str(value_object.get("value", ""))
-        if value_object.get("useInAppDefault") is True:
-            return "Use in-app default"
-    return json.dumps(value_object, ensure_ascii=False, sort_keys=True)
-
-
-def get_parameter_values(parameter: dict) -> list[dict]:
-    values = []
-    if "defaultValue" in parameter:
-        values.append({"source": "Default", "condition": "", "value": format_remote_config_value(parameter.get("defaultValue"))})
-    for condition_name, value_object in (parameter.get("conditionalValues", {}) or {}).items():
-        values.append({"source": "Conditional", "condition": condition_name, "value": format_remote_config_value(value_object)})
-    return values
-
-
-def find_remote_config_parameter(template: dict, parameter_key: str) -> tuple[str, dict, str] | tuple[str, None, str]:
-    wanted = str(parameter_key or "").strip()
-    if not wanted:
-        return "", None, ""
-    wanted_lower = wanted.lower()
-    for key, parameter, group_name in iter_remote_config_parameters(template):
-        if key == wanted:
-            return key, parameter, group_name
-    for key, parameter, group_name in iter_remote_config_parameters(template):
-        key_lower = key.lower()
-        if wanted_lower in key_lower or key_lower in wanted_lower:
-            return key, parameter, group_name
-    return wanted, None, ""
-
-
-def get_remote_config_condition_map(template: dict) -> dict[str, str]:
-    """Return Remote Config condition name -> expression."""
-    return {
-        str(condition.get("name", "")): str(condition.get("expression", ""))
-        for condition in (template.get("conditions", []) or [])
-        if condition.get("name")
-    }
-
-
-def extract_fetch_percent(condition_expression: str) -> str:
-    """Best-effort percentage extraction from a Remote Config condition.
-
-    The Remote Config template API does not expose the console's Fetch % as a
-    dedicated parameter field. Default values apply to the remaining audience,
-    so they are represented as 100%. For conditional values, a percentage is
-    returned only when it can be inferred from the condition expression.
-    """
-    expression = str(condition_expression or "")
-    if not expression:
-        return ""
-
-    # Examples commonly seen in Remote Config percentile conditions:
-    # percent <= 50, percent < 25, percent in [10, 40].
-    range_match = re.search(
-        r"percent\s+in\s*\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]",
-        expression,
-        flags=re.IGNORECASE,
-    )
-    if range_match:
-        start = float(range_match.group(1))
-        end = float(range_match.group(2))
-        value = max(end - start, 0)
-        return f"{value:g}%"
-
-    threshold_match = re.search(
-        r"percent\s*(?:<=|<|==)\s*(\d+(?:\.\d+)?)",
-        expression,
-        flags=re.IGNORECASE,
-    )
-    if threshold_match:
-        return f"{float(threshold_match.group(1)):g}%"
-
-    return ""
-
-
-def format_last_published(version: dict) -> str:
-    """Format template-level publication metadata for sheet output."""
-    update_time = str(version.get("updateTime", "") or "").strip()
-    update_user = version.get("updateUser", {}) or {}
-    publisher = str(update_user.get("email", "") or update_user.get("name", "") or "").strip()
-    if publisher and update_time:
-        return f"{publisher} | {update_time}"
-    return publisher or update_time
-
-
-def build_remote_parameter_rows(
-    parameter_key: str,
-    parameter: dict | None,
-    group_name: str,
-    condition_map: dict[str, str],
-    last_published: str,
-    missing_message: str = "",
-) -> list[dict]:
-    """Build structured rows matching Name/Condition/Value/Fetch %/Published."""
-    if parameter is None:
-        return [
-            {
-                "name": parameter_key,
-                "condition": "",
-                "value": missing_message or "Parameter not found",
-                "fetch_percent": "",
-                "last_published": last_published,
-            }
-        ]
-
-    rows: list[dict] = []
-    for value_row in get_parameter_values(parameter):
-        value = value_row.get("value", "")
-        if value == "":
-            continue
-
-        condition_name = str(value_row.get("condition", "") or "").strip()
-        is_default = value_row.get("source") == "Default"
-        condition_label = "Default value" if is_default else condition_name
-        fetch_percent = "100%" if is_default else extract_fetch_percent(condition_map.get(condition_name, ""))
-        display_name = parameter_key if not group_name else f"{group_name}/{parameter_key}"
-
-        rows.append(
-            {
-                "name": display_name,
-                "condition": condition_label,
-                "value": value,
-                "fetch_percent": fetch_percent,
-                "last_published": last_published,
-            }
-        )
-
-    if rows:
-        return rows
-
-    return [
-        {
-            "name": parameter_key,
-            "condition": "",
-            "value": "No configured value",
-            "fetch_percent": "",
-            "last_published": last_published,
-        }
-    ]
-
-
-def find_iap_parameters(template: dict, explicit_key: str) -> list[tuple[str, dict, str]]:
-    matches = []
-    seen = set()
-    if explicit_key:
-        key, parameter, group_name = find_remote_config_parameter(template, explicit_key)
-        if parameter is not None:
-            matches.append((key, parameter, group_name))
-            seen.add((group_name, key))
-    keywords = [k.lower() for k in split_csv(config.iap_screen_parameter_keywords)]
-    if explicit_key and explicit_key.lower() not in keywords:
-        keywords.insert(0, explicit_key.lower())
-    for key, parameter, group_name in iter_remote_config_parameters(template):
-        unique = (group_name, key)
-        if unique in seen:
-            continue
-        key_lower = key.lower()
-        if any(keyword and keyword in key_lower for keyword in keywords):
-            matches.append((key, parameter, group_name))
-            seen.add(unique)
-    return matches
-
-
-def get_remote_config_ab_rows(app: AppConfig) -> dict:
-    empty = {
-        "time_capping_rows": [
-            {
-                "name": app.time_capping_parameter or config.time_capping_parameter,
-                "condition": "",
-                "value": "Firebase Project ID was not discovered or is not accessible.",
-                "fetch_percent": "",
-                "last_published": "",
-            }
-        ],
-        "iap_screen_rows": [
-            {
-                "name": app.iap_screen_parameter or config.iap_screen_parameter,
-                "condition": "",
-                "value": "Firebase Project ID was not discovered or is not accessible.",
-                "fetch_percent": "",
-                "last_published": "",
-            }
-        ],
-    }
-    if not app.firebase_project_id:
-        return empty
-
-    try:
-        template = get_firebase_remote_config_template(app.firebase_project_id)
-        version = template.get("version", {}) or {}
-        last_published = format_last_published(version)
-        condition_map = get_remote_config_condition_map(template)
-
-        time_key = app.time_capping_parameter or config.time_capping_parameter
-        matched_time_key, time_param, time_group = find_remote_config_parameter(template, time_key)
-        time_capping_rows = build_remote_parameter_rows(
-            matched_time_key or time_key,
-            time_param,
-            time_group,
-            condition_map,
-            last_published,
-            missing_message=f"Parameter not found: {time_key}",
-        )
-
-        iap_key = app.iap_screen_parameter or config.iap_screen_parameter
-        iap_matches = find_iap_parameters(template, iap_key)
-        if not iap_matches:
-            iap_screen_rows = build_remote_parameter_rows(
-                iap_key,
-                None,
-                "",
-                condition_map,
-                last_published,
-                missing_message=(
-                    f"No IAP/paywall config found for {iap_key} or configured IAP keywords."
-                ),
-            )
-        else:
-            iap_screen_rows = []
-            for key, parameter, group_name in iap_matches[:20]:
-                iap_screen_rows.extend(
-                    build_remote_parameter_rows(
-                        key,
-                        parameter,
-                        group_name,
-                        condition_map,
-                        last_published,
-                    )
-                )
-
-        return {
-            "time_capping_rows": time_capping_rows,
-            "iap_screen_rows": iap_screen_rows,
-        }
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FIREBASE REMOTE CONFIG {status} for {app.app_name}: {error_text}")
-        message = f"{status}: {error_text}"
-        return {
-            "time_capping_rows": [
-                {
-                    "name": app.time_capping_parameter or config.time_capping_parameter,
-                    "condition": "",
-                    "value": message,
-                    "fetch_percent": "",
-                    "last_published": "",
-                }
-            ],
-            "iap_screen_rows": [
-                {
-                    "name": app.iap_screen_parameter or config.iap_screen_parameter,
-                    "condition": "",
-                    "value": message,
-                    "fetch_percent": "",
-                    "last_published": "",
-                }
-            ],
-        }
-
-
-
-
-# =========================
-# FCM NOTIFICATION DELIVERY
-# =========================
-# The FCM Data API payload contains several delivery statistics. This script
-# intentionally reads only the three retained output fields:
-# - firebase_notifications_accepted
-# - firebase_delivered
-# - firebase_pending
-
-
-def get_notification_api_session():
-    global notification_api_session
-    if notification_api_session is None:
-        notification_api_session = AuthorizedSession(credentials)
-    return notification_api_session
-
-
-def format_fcm_date(date_data: dict) -> str:
-    year = int(date_data.get("year", 0) or 0)
-    month = int(date_data.get("month", 0) or 0)
-    day = int(date_data.get("day", 0) or 0)
-    if year and month and day:
-        return f"{year:04d}-{month:02d}-{day:02d}"
-    return ""
-
-
-def get_percent(data: dict, key: str) -> str:
-    value = data.get(key, "") if data else ""
-    if value in [None, ""]:
-        return ""
-    try:
-        return f"{round(float(value), 2)}%"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def looks_like_firebase_app_id(value: str) -> bool:
-    value = str(value or "").strip()
-    return re.match(r"^1:\d+:(android|ios|web):", value) is not None
-
-
-def list_firebase_android_apps(project_identifier: str) -> list[dict]:
-    """Resolve an Android Firebase App ID only when Apps Config lacks one.
-
-    This Firebase Management API request is skipped when Apps Config already
-    contains a canonical Firebase app ID such as 1:123:android:abc.
-    """
-    project_identifier = str(project_identifier or "").strip()
-    if not project_identifier:
-        return []
-    if project_identifier in firebase_android_apps_cache:
-        return firebase_android_apps_cache[project_identifier]
-
-    apps: list[dict] = []
-    page_token = ""
-    while True:
-        parent = f"projects/{quote(project_identifier, safe='-')}"
-        url = f"{config.firebase_management_api_base}/{parent}/androidApps"
-        params = {"pageSize": 100}
-        if page_token:
-            params["pageToken"] = page_token
-        response = get_notification_api_session().get(
-            url,
-            params=params,
-            timeout=config.firebase_remote_config_timeout,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Firebase Management API error {response.status_code}: {response.text}"
-            )
-        payload = response.json()
-        apps.extend(payload.get("apps", []) or [])
-        page_token = payload.get("nextPageToken", "")
-        if not page_token:
-            break
-
-    firebase_android_apps_cache[project_identifier] = apps
-    return apps
-
-
-def choose_firebase_android_app(app: AppConfig, apps: list[dict]) -> dict | None:
-    if not apps:
-        return None
-
-    configured_value = str(app.firebase_app_id or "").strip().lower()
-    app_name = str(app.app_name or "").strip().lower()
-
-    if configured_value:
-        for item in apps:
-            if str(item.get("appId", "")).strip().lower() == configured_value:
-                return item
-        for item in apps:
-            if str(item.get("packageName", "")).strip().lower() == configured_value:
-                return item
-
-    if app_name:
-        for item in apps:
-            display_name = str(item.get("displayName", "")).strip().lower()
-            package_name = str(item.get("packageName", "")).strip().lower()
-            if display_name and (display_name in app_name or app_name in display_name):
-                return item
-            if package_name and (package_name in app_name or app_name in package_name):
-                return item
-
-    if len(apps) == 1:
-        return apps[0]
-    return None
-
-
-def resolve_fcm_project_and_app_id(app: AppConfig) -> tuple[str, str, str]:
-    project_identifier = str(app.firebase_project_id or "").strip()
-    configured_app_id = str(app.firebase_app_id or "").strip()
-
-    if not project_identifier:
-        raise ValueError("Firebase Project ID could not be discovered for this app.")
-
-    # Preferred path: no Firebase Management API request.
-    if looks_like_firebase_app_id(configured_app_id):
-        return project_identifier, configured_app_id, "Using discovered Firebase App ID."
-
-    # Fallback path for an empty ID or package-name value.
-    android_apps = list_firebase_android_apps(project_identifier)
-    selected = choose_firebase_android_app(app, android_apps)
-    if selected:
-        note = (
-            "Firebase App ID was not present in the GA4 stream; auto-resolved from Firebase Android apps list."
-            if not configured_app_id
-            else f"Firebase App ID resolved from discovered value '{configured_app_id}'."
-        )
-        return (
-            selected.get("projectId") or project_identifier,
-            selected.get("appId", ""),
-            note,
-        )
-
-    if not configured_app_id:
-        raise ValueError(
-            "Firebase App ID is empty in Apps Config and could not be resolved."
-        )
-    raise ValueError(
-        "Invalid Firebase App ID. Use an Android Firebase App ID like "
-        "1:1234567890:android:abcdef, or a package name resolvable through "
-        "the Firebase Management API."
-    )
-
-
-def request_fcm_delivery_data(project_id: str, app_id: str, encode_colons: bool = False) -> dict:
-    project_part = quote(str(project_id).strip(), safe="-")
-    app_safe = "" if encode_colons else ":"
-    app_part = quote(str(app_id).strip(), safe=app_safe)
-    parent = f"projects/{project_part}/androidApps/{app_part}"
-    url = f"{config.fcm_data_api_base}/{parent}/deliveryData"
-
-    delivery_rows: list[dict] = []
-    page_token = ""
-    seen_page_tokens: set[str] = set()
-
-    while True:
-        params = {"pageSize": config.fcm_data_page_size}
-        if page_token:
-            params["pageToken"] = page_token
-
-        response = get_notification_api_session().get(
-            url,
-            params=params,
-            timeout=config.firebase_remote_config_timeout,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"FCM Data API error {response.status_code}: {response.text}"
-            )
-
-        payload = response.json()
-        delivery_rows.extend(payload.get("androidDeliveryData", []) or [])
-
-        next_page_token = str(payload.get("nextPageToken", "") or "")
-        if not next_page_token:
-            break
-        if next_page_token in seen_page_tokens:
-            raise RuntimeError("FCM Data API returned a repeated nextPageToken.")
-
-        seen_page_tokens.add(next_page_token)
-        page_token = next_page_token
-
-    return {"androidDeliveryData": delivery_rows}
-
-
-def get_fcm_delivery_data_for_app(app: AppConfig) -> dict:
-    project_id, app_id, resolution_note = resolve_fcm_project_and_app_id(app)
-    cache_key = (project_id, app_id)
-    if cache_key in fcm_delivery_cache:
-        cached_payload = dict(fcm_delivery_cache[cache_key])
-        cached_payload["_resolution_note"] = resolution_note + " Reused cached response."
-        return cached_payload
-
-    try:
-        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=False)
-    except RuntimeError as error:
-        error_text = str(error)
-        if "400" not in error_text and "INVALID_ARGUMENT" not in error_text:
-            raise
-        payload = request_fcm_delivery_data(project_id, app_id, encode_colons=True)
-        resolution_note += " Retried with encoded Firebase App ID."
-
-    payload["_resolution_note"] = resolution_note
-    fcm_delivery_cache[cache_key] = dict(payload)
-    return payload
-
-
-def build_fcm_delivery_fields_by_date(app: AppConfig, report_dates: list[str]) -> dict[str, dict]:
-    """Return date-level FCM totals across every analytics-label row."""
-    result: dict[str, dict] = {report_date: {} for report_date in report_dates}
-    try:
-        response = get_fcm_delivery_data_for_app(app)
-        delivery_rows = response.get("androidDeliveryData", []) or []
-        grouped: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-
-        for delivery in delivery_rows:
-            delivery_date = format_fcm_date(delivery.get("date", {}) or {})
-            if delivery_date in grouped:
-                grouped[delivery_date].append(delivery)
-
-        for report_date, items in grouped.items():
-            if not items:
-                continue
-
-            total_messages_accepted = 0.0
-            delivered_weighted_total = 0.0
-            pending_weighted_total = 0.0
-
-            for item in items:
-                data = item.get("data", {}) or {}
-                messages_accepted = max(
-                    0.0,
-                    to_float(data.get("countMessagesAccepted", 0)),
-                )
-                if messages_accepted == 0:
-                    continue
-
-                outcome = data.get("messageOutcomePercents", {}) or {}
-                total_messages_accepted += messages_accepted
-                delivered_weighted_total += messages_accepted * to_float(
-                    outcome.get("delivered", 0)
-                )
-                pending_weighted_total += messages_accepted * to_float(
-                    outcome.get("pending", 0)
-                )
-
-            if total_messages_accepted == 0:
-                continue
-
-            delivered_percent = delivered_weighted_total / total_messages_accepted
-            pending_percent = pending_weighted_total / total_messages_accepted
-
-            result[report_date] = {
-                # Keep the existing column name for spreadsheet compatibility.
-                # Its value now uses the same countMessagesAccepted denominator
-                # as the delivered and pending percentages.
-                "firebase_notifications_accepted": to_number(total_messages_accepted),
-                "firebase_delivered": get_percent(
-                    {"value": delivered_percent},
-                    "value",
-                ),
-                "firebase_pending": get_percent(
-                    {"value": pending_percent},
-                    "value",
-                ),
-            }
-
-        return result
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
-        return result
-
-def get_event_metric(event_data: dict, report_date: str, event_name: str) -> dict:
-    return event_data.get((report_date, event_name), {}) or {}
-
-
-def pick_first_available_event(event_data: dict, report_date: str, event_names: list[str]) -> tuple[str, dict]:
-    for event_name in event_names:
-        data = get_event_metric(event_data, report_date, event_name)
-        if to_float(data.get("active_users", 0)) or to_float(data.get("event_count", 0)):
-            return event_name, data
-    if event_names:
-        return event_names[0], get_event_metric(event_data, report_date, event_names[0])
-    return "", {}
-
-
-def get_home_metrics_for_date(report_date: str, app: AppConfig, event_data: dict, home_data: dict) -> tuple[str, int, int, str]:
-    home_event_names = split_csv(app.home_event_names)
-    if home_event_names:
-        home_event, home_event_data = pick_first_available_event(event_data, report_date, home_event_names)
-        return (
-            home_event,
-            to_number(home_event_data.get("active_users", 0)),
-            to_number(home_event_data.get("event_count", 0)),
-            f"eventName = {home_event}",
-        )
-
-    screen_data = home_data.get(report_date, {})
-    detected_filter = (
-        f"eventName = screen_view AND {app.screen_field} = {app.home_screen_name}"
-        if app.screen_field and app.home_screen_name
-        else "No home event or detectable screen_view dimension"
-    )
-    return (
-        "screen_view" if app.home_screen_name else "",
-        to_number(screen_data.get("active_users", 0)),
-        to_number(screen_data.get("event_count", 0)),
-        detected_filter,
-    )
-
+# BigQuery does not allow '/' in a column name, so the four original slash
+# columns use underscores. Every other requested output column is retained.
 PERSONALIZED_COLUMN_SPECS = [
     ("Country", "country"),
     ("Language", "language"),
@@ -2223,22 +50,6 @@ PERSONALIZED_COLUMN_SPECS = [
     ("Top Screens / Screen Class", "screen_class"),
 ]
 
-# These events backed removed output columns and must not be included in the
-# shared GA4 event report, even when they are accidentally listed as feature
-# events in an existing Apps Config row or repository variable.
-EXCLUDED_GA4_EVENT_NAMES = {
-    "notification_receive",
-    "notification_foreground",
-    "notification_open",
-    "notification_dismiss",
-    "dn_rc_inter_clicked",
-    "dn_rc_inter_displayed",
-    "dn_rc_inter_loaded",
-    "dn_rc_inter_requested",
-    "dn_rc_inter_dismissed",
-}
-
-
 FCM_COLUMNS = [
     "firebase_notifications_accepted",
     "firebase_delivered",
@@ -2247,30 +58,9 @@ FCM_COLUMNS = [
 
 
 def build_output_headers() -> list[str]:
-    headers = [
-        "App Name",
-        "GA4 Property ID",
-        "GA4 Stream ID",
-        "Firebase Project ID",
-        "Firebase Project Name",
-        "Firebase App ID",
-        "Package Name",
-        "Detected Home Screen",
-        "Detected Screen Field",
-        "Home Detection Method",
-        "Date",
-    ]
+    headers = ["Package Name", "Date"]
     headers.extend(FCM_COLUMNS)
-
-    headers.extend(
-        [
-            "Audien Name",
-            "Events Name",
-            "Countries",
-            "Total_Users",
-        ]
-    )
-
+    headers.extend(["Audien Name", "Events Name", "Countries", "Total_Users"])
     headers.extend(
         [
             "funnel_app_open_users",
@@ -2279,13 +69,12 @@ def build_output_headers() -> list[str]:
             "funnel_home_events_views",
             "funnel_possible_drop_off",
             "funnel_home_reach_rate",
-            "funnel_ad_impression/events",
-            "funnel_ad_impression/users",
-            "funnel_in_app_purchase/events",
-            "funnel_in_app_purchase/users",
+            "funnel_ad_impression_events",
+            "funnel_ad_impression_users",
+            "funnel_in_app_purchase_events",
+            "funnel_in_app_purchase_users",
         ]
     )
-
     headers.extend(
         [
             "time_capping_name",
@@ -2313,12 +102,8 @@ def build_output_headers() -> list[str]:
             "retention_d3_first_session_retention",
             "retention_d7_first_session_retention",
             "retention_d30_first_session_retention",
-            # Personalized categories are independent side-by-side row groups.
-            # Values (country, language, version, screen, etc.) stay in cells,
-            # never in fixed or rank-based column names.
         ]
     )
-
     for _, slug in PERSONALIZED_COLUMN_SPECS:
         headers.extend(
             [
@@ -2329,7 +114,6 @@ def build_output_headers() -> list[str]:
                 f"personalized_{slug}_avg",
             ]
         )
-
     if len(headers) != len(set(headers)):
         duplicates = sorted({name for name in headers if headers.count(name) > 1})
         raise ValueError(f"Duplicate output headers found: {duplicates}")
@@ -2338,294 +122,2099 @@ def build_output_headers() -> list[str]:
 
 OUTPUT_HEADERS = build_output_headers()
 
+INTEGER_COLUMNS = {
+    "firebase_notifications_accepted",
+    "Total_Users",
+    "funnel_app_open_users",
+    "funnel_app_open_events",
+    "funnel_home_users",
+    "funnel_home_events_views",
+    "funnel_possible_drop_off",
+    "funnel_ad_impression_events",
+    "funnel_ad_impression_users",
+    "funnel_in_app_purchase_events",
+    "funnel_in_app_purchase_users",
+    "time_analysis_active_users",
+    "time_analysis_new_users",
+    "time_analysis_sessions",
+    "time_analysis_engaged_sessions",
+}
+for _, _slug in PERSONALIZED_COLUMN_SPECS:
+    INTEGER_COLUMNS.add(f"personalized_{_slug}_users")
+    INTEGER_COLUMNS.add(f"personalized_{_slug}_sessions")
 
-def set_audience_columns(row: dict, item: dict):
-    row["Audien Name"] = item.get("Audien Name", "")
-    row["Events Name"] = item.get("Events Name", "")
-    row["Countries"] = item.get("Countries", "")
-    row["Total_Users"] = item.get("Total_Users", "")
+FLOAT_COLUMNS = {"time_analysis_sessions_per_active_user"}
 
 
-def set_funnel_columns(
-    row: dict,
-    report_date: str,
-    app: AppConfig,
-    event_data: dict,
-    home_data: dict,
-):
-    app_open_event, app_open_data = pick_first_available_event(
-        event_data,
-        report_date,
-        split_csv(app.app_open_event_names),
+def build_bigquery_schema() -> list[bigquery.SchemaField]:
+    schema: list[bigquery.SchemaField] = []
+    for name in OUTPUT_HEADERS:
+        if name == "Date":
+            field_type = "DATE"
+        elif name in INTEGER_COLUMNS:
+            field_type = "INT64"
+        elif name in FLOAT_COLUMNS:
+            field_type = "FLOAT64"
+        else:
+            field_type = "STRING"
+        schema.append(bigquery.SchemaField(name, field_type, mode="NULLABLE"))
+    return schema
+
+
+BIGQUERY_SCHEMA = build_bigquery_schema()
+
+SYSTEM_EVENTS = {
+    "ad_activeview",
+    "ad_click",
+    "ad_exposure",
+    "ad_impression",
+    "ad_query",
+    "adunit_exposure",
+    "app_clear_data",
+    "app_exception",
+    "app_install",
+    "app_open",
+    "app_remove",
+    "app_store_refund",
+    "app_store_subscription_cancel",
+    "app_store_subscription_convert",
+    "app_store_subscription_renew",
+    "app_update",
+    "click",
+    "error",
+    "file_download",
+    "firebase_campaign",
+    "firebase_in_app_message_action",
+    "firebase_in_app_message_dismiss",
+    "firebase_in_app_message_impression",
+    "first_open",
+    "first_visit",
+    "form_start",
+    "form_submit",
+    "in_app_purchase",
+    "notification_dismiss",
+    "notification_foreground",
+    "notification_open",
+    "notification_receive",
+    "os_update",
+    "page_view",
+    "screen_view",
+    "scroll",
+    "session_start",
+    "user_engagement",
+    "video_complete",
+    "video_progress",
+    "video_start",
+    "view_search_results",
+}
+
+EXCLUDED_GA4_EVENT_NAMES = {
+    "notification_receive",
+    "notification_foreground",
+    "notification_open",
+    "notification_dismiss",
+    "dn_rc_inter_clicked",
+    "dn_rc_inter_displayed",
+    "dn_rc_inter_loaded",
+    "dn_rc_inter_requested",
+    "dn_rc_inter_dismissed",
+}
+
+RETENTION_DAY_OFFSETS = (1, 3, 7, 30)
+
+
+@dataclass(frozen=True)
+class FirebaseProject:
+    project_id: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class FirebaseApp:
+    app_id: str
+    project_id: str
+    project_name: str
+    display_name: str
+    platform: str
+    namespace: str
+
+
+@dataclass
+class AppTarget:
+    app_name: str
+    property_id: str
+    ga4_stream_id: str
+    package_name: str
+    firebase_project_id: str = ""
+    firebase_project_name: str = ""
+    firebase_app_id: str = ""
+    home_screen_name: str = ""
+    screen_field: str = ""
+    app_open_event_names: str = ""
+    home_event_names: str = ""
+
+
+def split_csv(value: str) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def normalize(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def to_float(value: Any) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def to_number(value: Any) -> int | float:
+    number = to_float(value)
+    return int(number) if number.is_integer() else round(number, 2)
+
+
+def percent(value: Any) -> str:
+    try:
+        number = float(value)
+        if abs(number) <= 1:
+            number *= 100
+        return f"{round(number, 2)}%"
+    except (TypeError, ValueError):
+        return ""
+
+
+def rate(numerator: Any, denominator: Any) -> str:
+    denominator_value = to_float(denominator)
+    if denominator_value == 0:
+        return "0%"
+    return f"{round((to_float(numerator) / denominator_value) * 100, 2)}%"
+
+
+def format_seconds(seconds_value: Any) -> str:
+    total = max(int(round(to_float(seconds_value))), 0)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    seconds = total % 60
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{minutes}m {seconds}s"
+
+
+def ga4_date_to_iso(value: str) -> str:
+    value = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", value):
+        return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
+    return value
+
+
+def resolve_ga4_date(value: str, timezone: str) -> str:
+    value = str(value).strip()
+    today = datetime.now(ZoneInfo(timezone)).date()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value
+    if value.lower() == "today":
+        return today.isoformat()
+    if value.lower() == "yesterday":
+        return (today - timedelta(days=1)).isoformat()
+    match = re.fullmatch(r"(\d+)daysAgo", value, flags=re.IGNORECASE)
+    if match:
+        return (today - timedelta(days=int(match.group(1)))).isoformat()
+    raise ValueError(
+        f"Unsupported GA4 date '{value}'. Use YYYY-MM-DD, today, yesterday, or NdaysAgo."
     )
-    app_open_users = to_number(app_open_data.get("active_users", 0))
-    app_open_events = to_number(app_open_data.get("event_count", 0))
-    _, home_users, home_views, _ = get_home_metrics_for_date(
-        report_date,
-        app,
-        event_data,
-        home_data,
-    )
-
-    row["funnel_app_open_users"] = app_open_users
-    row["funnel_app_open_events"] = app_open_events
-    row["funnel_home_users"] = home_users
-    row["funnel_home_events_views"] = home_views
-    row["funnel_possible_drop_off"] = max(
-        int(to_float(app_open_users) - to_float(home_users)),
-        0,
-    )
-    row["funnel_home_reach_rate"] = rate(home_users, app_open_users)
-
-    for event_name in ("ad_impression", "in_app_purchase"):
-        data = get_event_metric(event_data, report_date, event_name)
-        row[f"funnel_{event_name}/events"] = to_number(data.get("event_count", 0))
-        row[f"funnel_{event_name}/users"] = to_number(data.get("active_users", 0))
 
 
-def set_ab_parameter_columns(row: dict, prefix: str, item: dict):
-    row[f"{prefix}_name"] = item.get("name", "")
-    row[f"{prefix}_condition"] = item.get("condition", "")
-    row[f"{prefix}_value"] = item.get("value", "")
-    row[f"{prefix}_fetch_percent"] = item.get("fetch_percent", "")
-    row[f"{prefix}_last_published"] = item.get("last_published", "")
-
-
-def set_time_analysis_columns(row: dict, metrics: dict):
-    row["time_analysis_country"] = metrics.get("Country", "")
-    row["time_analysis_active_users"] = metrics.get("Active Users", 0)
-    row["time_analysis_new_users"] = metrics.get("New Users", 0)
-    row["time_analysis_sessions"] = metrics.get("Sessions", 0)
-    row["time_analysis_engaged_sessions"] = metrics.get("Engaged Sessions", 0)
-    row["time_analysis_engagement_rate"] = metrics.get("Engagement Rate", "0%")
-    row["time_analysis_avg_session_duration"] = metrics.get("Avg Session Duration", "0m 0s")
-    row["time_analysis_sessions_per_active_user"] = metrics.get("Sessions Per Active User", 0)
-    row["time_analysis_total_engagement_time"] = metrics.get("Total Engagement Time", "0m 0s")
-
-
-def set_retention_columns(row: dict, retention: dict):
-    row["retention_cohort_date"] = retention.get("Cohort Date", "")
-    row["retention_country"] = retention.get("Country", "")
-    row["retention_d1_first_session_retention"] = retention.get("D1 Retention", "Not available")
-    row["retention_d3_first_session_retention"] = retention.get("D3 Retention", "Not available")
-    row["retention_d7_first_session_retention"] = retention.get("D7 Retention", "Not available")
-    row["retention_d30_first_session_retention"] = retention.get("D30 Retention", "Not available")
-
-
-def set_personalized_columns(row: dict, slug: str, item: dict):
-    """Set one Personalized UX item in its category-specific column group.
-
-    The actual value remains data in the category column. For example, Ukraine
-    is written to personalized_category_country; it is never embedded in a
-    header. Each category is independent and can occupy the same output row as
-    the first item from another category.
-    """
-    row[f"personalized_category_{slug}"] = item.get("value", "")
-    row[f"personalized_{slug}_users"] = item.get("active", "")
-    row[f"personalized_{slug}_sessions"] = item.get("sessions", "")
-    row[f"personalized_{slug}_er"] = item.get("engagement", "")
-    row[f"personalized_{slug}_avg"] = item.get("avg", "")
-
-
-def build_rows_for_app(app: AppConfig, report_dates: list[str], package_name: str) -> list[list]:
-    print(f"Processing: {app.app_name} / {app.property_id} / {report_dates[0]} to {report_dates[-1]}")
-
-    feature_events = split_csv(app.feature_event_names)
-    app_open_events = split_csv(app.app_open_event_names)
-    home_event_names = split_csv(app.home_event_names)
-    required_funnel_events = ["ad_impression", "in_app_purchase"]
-    event_names = [
-        event_name
-        for event_name in split_csv(
-            ",".join(
-                feature_events
-                + required_funnel_events
-                + app_open_events
-                + home_event_names
-            )
+def get_report_dates(config: Config) -> list[str]:
+    start = datetime.fromisoformat(
+        resolve_ga4_date(config.start_date, config.timezone)
+    ).date()
+    end = datetime.fromisoformat(
+        resolve_ga4_date(config.end_date, config.timezone)
+    ).date()
+    if start > end:
+        raise ValueError(
+            f"START_DATE must be before END_DATE. Current: {start} to {end}"
         )
-        if event_name.lower() not in EXCLUDED_GA4_EVENT_NAMES
+    return [
+        (start + timedelta(days=index)).isoformat()
+        for index in range((end - start).days + 1)
     ]
 
-    time_analysis: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    event_data: dict[tuple[str, str], dict] = {}
-    home_data: dict[str, dict] = {}
-    retention_data: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    audience_rows: dict[str, list[dict]] = {report_date: [] for report_date in report_dates}
-    personalized_ux: dict[str, dict[str, list[dict]]] = {report_date: {} for report_date in report_dates}
-    fcm_delivery: dict[str, dict] = {report_date: {} for report_date in report_dates}
-    # A configured home-event override is respected. Otherwise detect the
-    # screen field and home screen independently for every discovered app.
-    if home_event_names:
-        app.home_detection_method = "Configured HOME_EVENT_NAMES override"
-    elif not apply_home_screen_override(app):
-        discover_home_screen(app)
 
-    remote_ab = get_remote_config_ab_rows(app)
+def load_credentials(raw_or_path: str) -> Credentials:
+    raw_or_path = str(raw_or_path).strip()
+    if raw_or_path.startswith("{"):
+        info = json.loads(raw_or_path)
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+    path = Path(raw_or_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(
+            "Service-account JSON must be JSON text or an existing JSON file path: "
+            f"{path}"
+        )
+    return service_account.Credentials.from_service_account_file(
+        str(path), scopes=SCOPES
+    )
 
+
+def credentials_project_id(credentials: Credentials, raw_or_path: str) -> str:
+    project_id = str(getattr(credentials, "project_id", "") or "").strip()
+    if project_id:
+        return project_id
     try:
-        time_analysis = run_time_analysis_report(app)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"TIME ANALYSIS {status} for {app.app_name}: {error_text}")
-    try:
-        event_data = run_event_report(app, event_names)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"EVENTS {status} for {app.app_name}: {error_text}")
-    if not home_event_names:
+        if raw_or_path.strip().startswith("{"):
+            return str(json.loads(raw_or_path).get("project_id", "")).strip()
+        return str(
+            json.loads(Path(raw_or_path).read_text(encoding="utf-8")).get(
+                "project_id", ""
+            )
+        ).strip()
+    except Exception:
+        return ""
+
+
+class GoogleRestClient:
+    def __init__(self, credentials: Credentials, config: Config) -> None:
+        self.session = AuthorizedSession(credentials)
+        self.timeout = config.request_timeout_seconds
+        self.max_retries = config.max_retries
+
+    def request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Mapping[str, Any] | None = None,
+        expected_statuses: Sequence[int] = (200,),
+    ) -> dict[str, Any]:
+        for attempt in range(self.max_retries + 1):
+            response: Response = self.session.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=self.timeout,
+            )
+            if response.status_code in expected_statuses:
+                if not response.content:
+                    return {}
+                return response.json()
+
+            retryable = response.status_code in {408, 429, 500, 502, 503, 504}
+            if retryable and attempt < self.max_retries:
+                retry_after = response.headers.get("Retry-After", "")
+                sleep_seconds = (
+                    float(retry_after)
+                    if retry_after.replace(".", "", 1).isdigit()
+                    else min(2**attempt, 30)
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            raise RuntimeError(
+                f"{method} {url} failed with HTTP {response.status_code}: "
+                f"{response.text[:2500]}"
+            )
+        raise RuntimeError(f"{method} {url} failed after retries")
+
+    def paginated_get(
+        self,
+        url: str,
+        *,
+        item_key: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        page_token = ""
+        base_params = dict(params or {})
+        while True:
+            request_params = dict(base_params)
+            if page_token:
+                request_params["pageToken"] = page_token
+            payload = self.request_json("GET", url, params=request_params)
+            for item in payload.get(item_key, []) or []:
+                if isinstance(item, dict):
+                    yield item
+            page_token = str(payload.get("nextPageToken", "") or "").strip()
+            if not page_token:
+                return
+
+
+class Pipeline:
+    def __init__(self, config: Config, credentials: Credentials) -> None:
+        self.config = config
+        self.credentials = credentials
+        self.rest = GoogleRestClient(credentials, config)
+        self.analytics = BetaAnalyticsDataClient(credentials=credentials)
+        self.metadata_dimensions_cache: dict[str, set[str]] = {}
+        self.remote_config_cache: dict[str, dict[str, Any]] = {}
+        self.audience_definition_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self.fcm_delivery_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+    # -------------------------
+    # Account/app discovery
+    # -------------------------
+    def list_ga4_properties(self) -> list[dict[str, str]]:
+        properties: list[dict[str, str]] = []
+        url = f"{self.config.ga4_admin_api_base}/accountSummaries"
+        for account in self.rest.paginated_get(
+            url,
+            item_key="accountSummaries",
+            params={"pageSize": 200},
+        ):
+            account_name = str(account.get("displayName", "") or "").strip()
+            for item in account.get("propertySummaries", []) or []:
+                resource = str(item.get("property", "") or "").strip()
+                property_id = resource.rsplit("/", 1)[-1]
+                if property_id:
+                    properties.append(
+                        {
+                            "property_id": property_id,
+                            "property_name": str(
+                                item.get("displayName", "") or ""
+                            ).strip(),
+                            "account_name": account_name,
+                        }
+                    )
+        deduplicated = {item["property_id"]: item for item in properties}
+        return sorted(
+            deduplicated.values(),
+            key=lambda item: (item["property_name"].lower(), item["property_id"]),
+        )
+
+    def list_ga4_android_streams(
+        self, property_item: Mapping[str, str]
+    ) -> list[dict[str, str]]:
+        property_id = property_item["property_id"]
+        url = f"{self.config.ga4_admin_api_base}/properties/{property_id}/dataStreams"
+        streams: list[dict[str, str]] = []
+        for item in self.rest.paginated_get(
+            url,
+            item_key="dataStreams",
+            params={"pageSize": 200},
+        ):
+            android = item.get("androidAppStreamData", {}) or {}
+            if not android:
+                continue
+            resource_name = str(item.get("name", "") or "").strip()
+            stream_id = resource_name.rsplit("/", 1)[-1]
+            package_name = str(android.get("packageName", "") or "").strip()
+            if not stream_id or not package_name:
+                continue
+            streams.append(
+                {
+                    "property_id": property_id,
+                    "property_name": str(
+                        property_item.get("property_name", "") or ""
+                    ).strip(),
+                    "stream_id": stream_id,
+                    "stream_name": str(item.get("displayName", "") or "").strip(),
+                    "firebase_app_id": str(
+                        android.get("firebaseAppId", "") or ""
+                    ).strip(),
+                    "package_name": package_name,
+                }
+            )
+        return streams
+
+    def list_firebase_projects(self) -> list[FirebaseProject]:
+        projects: list[FirebaseProject] = []
+        url = f"{self.config.firebase_management_api_base}/projects"
+        for item in self.rest.paginated_get(
+            url,
+            item_key="results",
+            params={"pageSize": 100},
+        ):
+            project_id = str(item.get("projectId", "") or "").strip()
+            if project_id:
+                projects.append(
+                    FirebaseProject(
+                        project_id=project_id,
+                        display_name=str(item.get("displayName", "") or "").strip(),
+                    )
+                )
+        return projects
+
+    def list_firebase_apps(
+        self, projects: Iterable[FirebaseProject]
+    ) -> list[FirebaseApp]:
+        apps: list[FirebaseApp] = []
+        for project in projects:
+            url = (
+                f"{self.config.firebase_management_api_base}/projects/"
+                f"{project.project_id}:searchApps"
+            )
+            try:
+                items = list(
+                    self.rest.paginated_get(
+                        url,
+                        item_key="apps",
+                        params={"pageSize": 100, "filter": "platform=ANDROID"},
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Firebase apps unavailable for %s: %s", project.project_id, exc
+                )
+                continue
+            for item in items:
+                if str(item.get("platform", "") or "").strip() != "ANDROID":
+                    continue
+                app_id = str(item.get("appId", "") or "").strip()
+                namespace = str(item.get("namespace", "") or "").strip()
+                if not app_id:
+                    continue
+                apps.append(
+                    FirebaseApp(
+                        app_id=app_id,
+                        project_id=project.project_id,
+                        project_name=project.display_name,
+                        display_name=str(item.get("displayName", "") or "").strip(),
+                        platform="ANDROID",
+                        namespace=namespace,
+                    )
+                )
+        return apps
+
+    def discover_apps(self) -> list[AppTarget]:
+        LOGGER.info("Discovering every GA4 property accessible to the service account")
+        properties = self.list_ga4_properties()
+        LOGGER.info("Accessible GA4 properties: %d", len(properties))
+
+        streams: list[dict[str, str]] = []
+        for property_item in properties:
+            try:
+                streams.extend(self.list_ga4_android_streams(property_item))
+            except Exception as exc:
+                LOGGER.warning(
+                    "GA4 data streams unavailable for property %s: %s",
+                    property_item["property_id"],
+                    exc,
+                )
+                if not self.config.continue_on_error:
+                    raise
+
+        LOGGER.info("Accessible Android GA4 data streams: %d", len(streams))
+        if not streams:
+            raise RuntimeError("No accessible Android GA4 data streams were found.")
+
+        firebase_projects: list[FirebaseProject] = []
+        firebase_apps: list[FirebaseApp] = []
         try:
-            home_data = run_home_screen_report(app)
-        except Exception as error:
-            status, error_text = classify_api_error(error)
-            print(f"HOME SCREEN {status} for {app.app_name}: {error_text}")
-    try:
-        retention_data = run_retention_report(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"RETENTION {status} for {app.app_name}: {error_text}")
-    try:
-        audience_rows = run_audience_report(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"AUDIENCE {status} for {app.app_name}: {error_text}")
-    try:
-        personalized_ux = run_personalized_ux(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"PERSONALIZED UX {status} for {app.app_name}: {error_text}")
-    try:
-        fcm_delivery = build_fcm_delivery_fields_by_date(app, report_dates)
-    except Exception as error:
-        status, error_text = classify_api_error(error)
-        print(f"FCM DELIVERY {status} for {app.app_name}: {error_text}")
-    rows: list[list] = []
-    for report_date in report_dates:
-        # Personalized UX categories are independent datasets. They are
-        # compacted side by side by row index so every category uses its own
-        # column group without creating stacked blocks or artificial gaps.
-        personalized_for_date = personalized_ux.get(report_date, {})
-        personalized_groups: dict[str, list[dict]] = {
-            slug: personalized_for_date.get(category, [])
-            for category, slug in PERSONALIZED_COLUMN_SPECS
+            firebase_projects = self.list_firebase_projects()
+            firebase_apps = self.list_firebase_apps(firebase_projects)
+            LOGGER.info(
+                "Accessible Firebase projects/apps: %d/%d",
+                len(firebase_projects),
+                len(firebase_apps),
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Firebase discovery failed; GA4 data will still be processed: %s", exc
+            )
+            if not self.config.continue_on_error:
+                raise
+
+        by_app_id = {app.app_id: app for app in firebase_apps}
+        by_package: dict[str, list[FirebaseApp]] = {}
+        for app in firebase_apps:
+            if app.namespace:
+                by_package.setdefault(app.namespace.lower(), []).append(app)
+
+        discovered: list[AppTarget] = []
+        for stream in streams:
+            firebase_app = by_app_id.get(stream["firebase_app_id"])
+            if firebase_app is None:
+                package_matches = by_package.get(stream["package_name"].lower(), [])
+                if len(package_matches) == 1:
+                    firebase_app = package_matches[0]
+
+            app_name = (
+                (firebase_app.display_name if firebase_app else "")
+                or stream["stream_name"]
+                or stream["property_name"]
+                or stream["package_name"]
+            )
+            discovered.append(
+                AppTarget(
+                    app_name=app_name,
+                    property_id=stream["property_id"],
+                    ga4_stream_id=stream["stream_id"],
+                    package_name=stream["package_name"],
+                    firebase_project_id=firebase_app.project_id if firebase_app else "",
+                    firebase_project_name=firebase_app.project_name
+                    if firebase_app
+                    else "",
+                    firebase_app_id=(
+                        firebase_app.app_id
+                        if firebase_app
+                        else stream["firebase_app_id"]
+                    ),
+                    home_screen_name=self.config.default_home_screen_name,
+                    screen_field=self.config.default_screen_field,
+                    app_open_event_names=self.config.app_open_event_names,
+                    home_event_names="",
+                )
+            )
+
+        unique: dict[tuple[str, str, str], AppTarget] = {}
+        for app in discovered:
+            unique[(app.property_id, app.ga4_stream_id, app.package_name)] = app
+        return sorted(
+            unique.values(),
+            key=lambda app: (app.app_name.lower(), app.property_id, app.ga4_stream_id),
+        )
+
+    # -------------------------
+    # GA4 helpers/config inference
+    # -------------------------
+    @staticmethod
+    def exact_filter(field_name: str, value: str) -> FilterExpression:
+        return FilterExpression(
+            filter=Filter(
+                field_name=field_name,
+                string_filter=Filter.StringFilter(
+                    match_type=Filter.StringFilter.MatchType.EXACT,
+                    value=value,
+                    case_sensitive=False,
+                ),
+            )
+        )
+
+    @staticmethod
+    def contains_filter(field_name: str, value: str) -> FilterExpression:
+        return FilterExpression(
+            filter=Filter(
+                field_name=field_name,
+                string_filter=Filter.StringFilter(
+                    match_type=Filter.StringFilter.MatchType.CONTAINS,
+                    value=value,
+                    case_sensitive=False,
+                ),
+            )
+        )
+
+    @staticmethod
+    def in_list_filter(field_name: str, values: list[str]) -> FilterExpression:
+        return FilterExpression(
+            filter=Filter(
+                field_name=field_name,
+                in_list_filter=Filter.InListFilter(values=values, case_sensitive=False),
+            )
+        )
+
+    @staticmethod
+    def and_filter(expressions: list[FilterExpression]) -> FilterExpression:
+        return FilterExpression(and_group=FilterExpressionList(expressions=expressions))
+
+    def report_filter(
+        self,
+        app: AppTarget,
+        base_filter: FilterExpression | None = None,
+    ) -> dict[str, FilterExpression]:
+        expressions = [self.exact_filter("streamId", app.ga4_stream_id)]
+        if base_filter is not None:
+            expressions.append(base_filter)
+        expression = (
+            expressions[0] if len(expressions) == 1 else self.and_filter(expressions)
+        )
+        return {"dimension_filter": expression}
+
+    @staticmethod
+    def date_order() -> OrderBy:
+        return OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))
+
+    @staticmethod
+    def metric_order(metric_name: str, desc: bool = True) -> OrderBy:
+        return OrderBy(
+            metric=OrderBy.MetricOrderBy(metric_name=metric_name),
+            desc=desc,
+        )
+
+    @staticmethod
+    def parse_response_rows(response: Any) -> list[dict[str, str]]:
+        dimension_headers = [header.name for header in response.dimension_headers]
+        metric_headers = [header.name for header in response.metric_headers]
+        rows: list[dict[str, str]] = []
+        for response_row in response.rows:
+            item: dict[str, str] = {}
+            for index, value in enumerate(response_row.dimension_values):
+                if index < len(dimension_headers):
+                    item[dimension_headers[index]] = value.value
+            for index, value in enumerate(response_row.metric_values):
+                if index < len(metric_headers):
+                    item[metric_headers[index]] = value.value
+            rows.append(item)
+        return rows
+
+    def get_metadata_dimensions(self, property_id: str) -> set[str]:
+        if property_id in self.metadata_dimensions_cache:
+            return self.metadata_dimensions_cache[property_id]
+        url = f"https://analyticsdata.googleapis.com/v1beta/properties/{property_id}/metadata"
+        payload = self.rest.request_json("GET", url)
+        dimensions = {
+            str(item.get("apiName", "") or "").strip()
+            for item in payload.get("dimensions", []) or []
+            if item.get("apiName")
+        }
+        self.metadata_dimensions_cache[property_id] = dimensions
+        return dimensions
+
+    def infer_ga4_app_configuration(self, app: AppTarget) -> None:
+        try:
+            available_dimensions = self.get_metadata_dimensions(app.property_id)
+            for candidate in split_csv(self.config.screen_field_candidates):
+                if candidate in available_dimensions:
+                    app.screen_field = candidate
+                    break
+
+            event_request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                    )
+                ],
+                dimensions=[Dimension(name="eventName")],
+                metrics=[Metric(name="eventCount")],
+                order_bys=[self.metric_order("eventCount")],
+                **self.report_filter(app),
+                limit=100000,
+            )
+            event_rows = self.parse_response_rows(
+                self.analytics.run_report(event_request)
+            )
+            observed_names = [
+                str(row.get("eventName", "") or "").strip()
+                for row in event_rows
+                if str(row.get("eventName", "") or "").strip()
+            ]
+            observed_set = set(observed_names)
+
+            app_open_names = [
+                name
+                for name in split_csv(self.config.app_open_event_names)
+                if name in observed_set
+            ]
+            if app_open_names:
+                app.app_open_event_names = ",".join(app_open_names)
+
+            home_keywords = [
+                normalize(item) for item in split_csv(self.config.home_event_keywords)
+            ]
+            custom_home_events = [
+                name
+                for name in observed_names
+                if name not in SYSTEM_EVENTS
+                and any(keyword in normalize(name) for keyword in home_keywords)
+            ]
+            app.home_event_names = ",".join(dict.fromkeys(custom_home_events))
+
+            screen_filter = self.and_filter(
+                [
+                    self.exact_filter("streamId", app.ga4_stream_id),
+                    self.exact_filter("eventName", "screen_view"),
+                ]
+            )
+            screen_request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                    )
+                ],
+                dimensions=[Dimension(name=app.screen_field)],
+                metrics=[Metric(name="eventCount")],
+                dimension_filter=screen_filter,
+                order_bys=[self.metric_order("eventCount")],
+                keep_empty_rows=False,
+                limit=100000,
+            )
+            screen_rows = self.parse_response_rows(
+                self.analytics.run_report(screen_request)
+            )
+            candidates: list[tuple[str, int]] = []
+            for row in screen_rows:
+                screen_name = str(row.get(app.screen_field, "") or "").strip()
+                if not screen_name or screen_name.lower() in {
+                    "(not set)",
+                    "not set",
+                    "unknown",
+                }:
+                    continue
+                candidates.append(
+                    (screen_name, int(to_float(row.get("eventCount", 0))))
+                )
+
+            if candidates:
+                screen_keywords = [
+                    normalize(item)
+                    for item in split_csv(self.config.home_screen_keywords)
+                ]
+
+                def screen_score(item: tuple[str, int]) -> tuple[int, int]:
+                    screen_name, count = item
+                    normalized = normalize(screen_name)
+                    keyword_score = sum(
+                        1 for keyword in screen_keywords if keyword in normalized
+                    )
+                    return keyword_score, count
+
+                app.home_screen_name = max(candidates, key=screen_score)[0]
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not fully infer GA4 config for %s (%s/%s): %s",
+                app.package_name,
+                app.property_id,
+                app.ga4_stream_id,
+                exc,
+            )
+            if not self.config.continue_on_error:
+                raise
+
+    # -------------------------
+    # GA4 reports
+    # -------------------------
+    def run_time_analysis_report(
+        self, app: AppTarget
+    ) -> dict[str, list[dict[str, Any]]]:
+        by_date: dict[str, list[dict[str, Any]]] = {}
+        page_size = 100000
+        offset = 0
+        while True:
+            request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                    )
+                ],
+                dimensions=[Dimension(name="date"), Dimension(name="country")],
+                metrics=[
+                    Metric(name="activeUsers"),
+                    Metric(name="newUsers"),
+                    Metric(name="sessions"),
+                    Metric(name="engagedSessions"),
+                    Metric(name="averageSessionDuration"),
+                    Metric(name="userEngagementDuration"),
+                    Metric(name="engagementRate"),
+                ],
+                order_bys=[self.date_order(), self.metric_order("activeUsers")],
+                **self.report_filter(app),
+                keep_empty_rows=False,
+                limit=page_size,
+                offset=offset,
+            )
+            response = self.analytics.run_report(request)
+            page_rows = self.parse_response_rows(response)
+            if not page_rows:
+                break
+            for row in page_rows:
+                report_date = ga4_date_to_iso(row.get("date", ""))
+                active_users = to_number(row.get("activeUsers", 0))
+                sessions = to_number(row.get("sessions", 0))
+                by_date.setdefault(report_date, []).append(
+                    {
+                        "Country": row.get("country", "") or "(not set)",
+                        "Active Users": active_users,
+                        "New Users": to_number(row.get("newUsers", 0)),
+                        "Sessions": sessions,
+                        "Engaged Sessions": to_number(row.get("engagedSessions", 0)),
+                        "Engagement Rate": percent(row.get("engagementRate", 0)),
+                        "Avg Session Duration": format_seconds(
+                            row.get("averageSessionDuration", 0)
+                        ),
+                        "Sessions Per Active User": (
+                            round(to_float(sessions) / to_float(active_users), 2)
+                            if to_float(active_users)
+                            else 0
+                        ),
+                        "Total Engagement Time": format_seconds(
+                            row.get("userEngagementDuration", 0)
+                        ),
+                    }
+                )
+            offset += len(page_rows)
+            total_rows = int(getattr(response, "row_count", 0) or 0)
+            if len(page_rows) < page_size or (total_rows and offset >= total_rows):
+                break
+        return by_date
+
+    def run_event_report(
+        self,
+        app: AppTarget,
+        event_names: list[str],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        if not event_names:
+            return {}
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[
+                DateRange(
+                    start_date=self.config.start_date,
+                    end_date=self.config.end_date,
+                )
+            ],
+            dimensions=[Dimension(name="date"), Dimension(name="eventName")],
+            metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
+            **self.report_filter(app, self.in_list_filter("eventName", event_names)),
+            order_bys=[self.date_order()],
+            keep_empty_rows=False,
+            limit=100000,
+        )
+        response = self.analytics.run_report(request)
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in self.parse_response_rows(response):
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            event_name = str(row.get("eventName", "") or "").strip()
+            result[(report_date, event_name)] = {
+                "active_users": to_number(row.get("activeUsers", 0)),
+                "event_count": to_number(row.get("eventCount", 0)),
+            }
+        return result
+
+    def run_home_screen_report(self, app: AppTarget) -> dict[str, dict[str, Any]]:
+        request = RunReportRequest(
+            property=f"properties/{app.property_id}",
+            date_ranges=[
+                DateRange(
+                    start_date=self.config.start_date,
+                    end_date=self.config.end_date,
+                )
+            ],
+            dimensions=[Dimension(name="date")],
+            metrics=[Metric(name="activeUsers"), Metric(name="eventCount")],
+            **self.report_filter(
+                app,
+                self.and_filter(
+                    [
+                        self.exact_filter("eventName", "screen_view"),
+                        self.contains_filter(app.screen_field, app.home_screen_name),
+                    ]
+                ),
+            ),
+            order_bys=[self.date_order()],
+            keep_empty_rows=True,
+            limit=100000,
+        )
+        response = self.analytics.run_report(request)
+        result: dict[str, dict[str, Any]] = {}
+        for row in self.parse_response_rows(response):
+            report_date = ga4_date_to_iso(row.get("date", ""))
+            result[report_date] = {
+                "active_users": to_number(row.get("activeUsers", 0)),
+                "event_count": to_number(row.get("eventCount", 0)),
+            }
+        return result
+
+    @staticmethod
+    def parse_cohort_day(value: Any) -> int:
+        digits = re.sub(r"[^0-9]", "", str(value or "0"))
+        return int(digits or 0)
+
+    @staticmethod
+    def retention_ready(
+        cohort_date: str,
+        day_offset: int,
+        observation_end_date: str,
+    ) -> bool:
+        cohort_day = datetime.fromisoformat(cohort_date).date()
+        target_day = cohort_day + timedelta(days=day_offset)
+        report_end_day = datetime.fromisoformat(observation_end_date).date()
+        return target_day <= report_end_day
+
+    def run_retention_report(
+        self,
+        app: AppTarget,
+        report_dates: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        retention_by_date = {report_date: [] for report_date in report_dates}
+        if not report_dates:
+            return retention_by_date
+        observation_end_date = max(report_dates)
+
+        # One cohort per request is slower but maps every result exactly to the
+        # requested cohort date and avoids cross-cohort ambiguity.
+        for cohort_date in report_dates:
+            country_data: dict[str, dict[str, Any]] = {}
+            page_size = 100000
+            offset = 0
+            while True:
+                request = RunReportRequest(
+                    property=f"properties/{app.property_id}",
+                    dimensions=[
+                        Dimension(name="cohort"),
+                        Dimension(name="cohortNthDay"),
+                        Dimension(name="country"),
+                    ],
+                    metrics=[
+                        Metric(name="cohortActiveUsers"),
+                        Metric(name="cohortTotalUsers"),
+                    ],
+                    cohort_spec=CohortSpec(
+                        cohorts=[
+                            Cohort(
+                                name=cohort_date,
+                                dimension="firstSessionDate",
+                                date_range=DateRange(
+                                    start_date=cohort_date,
+                                    end_date=cohort_date,
+                                ),
+                            )
+                        ],
+                        cohorts_range=CohortsRange(
+                            granularity=CohortsRange.Granularity.DAILY,
+                            start_offset=0,
+                            end_offset=max(RETENTION_DAY_OFFSETS),
+                        ),
+                    ),
+                    **self.report_filter(app),
+                    keep_empty_rows=True,
+                    limit=page_size,
+                    offset=offset,
+                )
+                response = self.analytics.run_report(request)
+                page_rows = self.parse_response_rows(response)
+                if not page_rows:
+                    break
+                for row in page_rows:
+                    returned_cohort = str(row.get("cohort", "") or "").strip()
+                    if returned_cohort not in {cohort_date, "cohort_0"}:
+                        continue
+                    country = str(row.get("country", "") or "").strip() or "(not set)"
+                    day_offset = self.parse_cohort_day(row.get("cohortNthDay", 0))
+                    active_users = to_float(row.get("cohortActiveUsers", 0))
+                    total_users = to_float(row.get("cohortTotalUsers", 0))
+                    item = country_data.setdefault(
+                        country,
+                        {"cohort_total_users": 0.0, "days": {}},
+                    )
+                    if day_offset == 0 and total_users > 0:
+                        item["cohort_total_users"] = total_users
+                    item["days"][day_offset] = active_users
+                offset += len(page_rows)
+                total_rows = int(getattr(response, "row_count", 0) or 0)
+                if len(page_rows) < page_size or (total_rows and offset >= total_rows):
+                    break
+
+            sorted_countries = sorted(
+                country_data.items(),
+                key=lambda item: (
+                    -to_float(item[1].get("cohort_total_users", 0)),
+                    item[0].lower(),
+                ),
+            )
+            for country, metrics in sorted_countries:
+                cohort_total = to_float(metrics.get("cohort_total_users", 0))
+                if cohort_total <= 0:
+                    continue
+                output_item: dict[str, Any] = {
+                    "Cohort Date": cohort_date,
+                    "Country": country,
+                }
+                for day_offset in RETENTION_DAY_OFFSETS:
+                    key = f"D{day_offset} Retention"
+                    if not self.retention_ready(
+                        cohort_date,
+                        day_offset,
+                        observation_end_date,
+                    ):
+                        output_item[key] = "Not available"
+                    else:
+                        active = to_float(metrics.get("days", {}).get(day_offset, 0))
+                        output_item[key] = f"{(active / cohort_total) * 100:.2f}%"
+                retention_by_date[cohort_date].append(output_item)
+        return retention_by_date
+
+    @staticmethod
+    def _append_unique(values: list[str], value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in values:
+            values.append(text)
+
+    def _collect_audience_fields(
+        self,
+        node: Any,
+        event_names: list[str],
+        countries: list[str],
+    ) -> None:
+        if isinstance(node, list):
+            for item in node:
+                self._collect_audience_fields(item, event_names, countries)
+            return
+        if not isinstance(node, dict):
+            return
+        event_filter = node.get("eventFilter")
+        if isinstance(event_filter, dict):
+            self._append_unique(event_names, event_filter.get("eventName", ""))
+        dimension_filter = node.get("dimensionOrMetricFilter")
+        if isinstance(dimension_filter, dict):
+            field_name = str(dimension_filter.get("fieldName", "") or "").lower()
+            if field_name in {"country", "countryid", "country_id"}:
+                string_filter = dimension_filter.get("stringFilter", {}) or {}
+                self._append_unique(countries, string_filter.get("value", ""))
+                in_list = dimension_filter.get("inListFilter", {}) or {}
+                for item in in_list.get("values", []) or []:
+                    self._append_unique(countries, item)
+        for value in node.values():
+            self._collect_audience_fields(value, event_names, countries)
+
+    def fetch_audience_definitions(self, app: AppTarget) -> dict[str, dict[str, Any]]:
+        if app.property_id in self.audience_definition_cache:
+            return self.audience_definition_cache[app.property_id]
+        definitions: dict[str, dict[str, Any]] = {}
+        url = (
+            f"{self.config.ga4_admin_audience_api_base}/properties/"
+            f"{app.property_id}/audiences"
+        )
+        try:
+            for audience in self.rest.paginated_get(
+                url,
+                item_key="audiences",
+                params={"pageSize": 200},
+            ):
+                resource_name = str(audience.get("name", "") or "").strip()
+                display_name = str(audience.get("displayName", "") or "").strip()
+                if not resource_name and not display_name:
+                    continue
+                event_names: list[str] = []
+                countries: list[str] = []
+                self._collect_audience_fields(
+                    audience.get("filterClauses", []) or [],
+                    event_names,
+                    countries,
+                )
+                event_trigger = audience.get("eventTrigger", {}) or {}
+                self._append_unique(event_names, event_trigger.get("eventName", ""))
+                definition = {
+                    "resource_name": resource_name,
+                    "display_name": display_name,
+                    "events_name": ", ".join(event_names),
+                    "countries": ", ".join(countries),
+                    "create_time": str(audience.get("createTime", "") or "").strip(),
+                }
+                definitions[resource_name or display_name] = definition
+        except Exception as exc:
+            LOGGER.warning(
+                "Audience definitions unavailable for %s: %s", app.package_name, exc
+            )
+            if not self.config.continue_on_error:
+                raise
+        self.audience_definition_cache[app.property_id] = definitions
+        return definitions
+
+    def run_audience_report(
+        self,
+        app: AppTarget,
+        report_dates: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        definitions = self.fetch_audience_definitions(app)
+        by_date = {report_date: [] for report_date in report_dates}
+        if not definitions:
+            return by_date
+
+        definitions_by_resource = {
+            str(item.get("resource_name", "") or "").strip(): item
+            for item in definitions.values()
+            if str(item.get("resource_name", "") or "").strip()
+        }
+        definitions_by_name = {
+            str(item.get("display_name", "") or "").strip(): item
+            for item in definitions.values()
+            if str(item.get("display_name", "") or "").strip()
+        }
+        totals_by_key: dict[str, float] = {}
+        page_size = 100000
+        offset = 0
+        while True:
+            request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                    )
+                ],
+                dimensions=[
+                    Dimension(name="audienceResourceName"),
+                    Dimension(name="audienceName"),
+                ],
+                metrics=[Metric(name="totalUsers")],
+                **self.report_filter(app),
+                order_bys=[self.metric_order("totalUsers")],
+                keep_empty_rows=False,
+                limit=page_size,
+                offset=offset,
+            )
+            response = self.analytics.run_report(request)
+            page_rows = self.parse_response_rows(response)
+            if not page_rows:
+                break
+            for row in page_rows:
+                resource_name = str(row.get("audienceResourceName", "") or "").strip()
+                reported_name = str(row.get("audienceName", "") or "").strip()
+                if reported_name in {"", "(not set)"}:
+                    continue
+                definition = definitions_by_resource.get(resource_name)
+                if definition is None:
+                    definition = definitions_by_name.get(reported_name)
+                if definition is None:
+                    continue
+                key = (
+                    str(definition.get("resource_name", "") or "").strip()
+                    or str(definition.get("display_name", "") or "").strip()
+                )
+                totals_by_key[key] = totals_by_key.get(key, 0.0) + to_float(
+                    row.get("totalUsers", 0)
+                )
+            offset += len(page_rows)
+            total_rows = int(getattr(response, "row_count", 0) or 0)
+            if len(page_rows) < page_size or (total_rows and offset >= total_rows):
+                break
+
+        summary_rows: list[dict[str, Any]] = []
+        for definition in definitions.values():
+            audience_name = str(definition.get("display_name", "") or "").strip()
+            if not audience_name:
+                continue
+            key = (
+                str(definition.get("resource_name", "") or "").strip() or audience_name
+            )
+            summary_rows.append(
+                {
+                    "Audien Name": audience_name,
+                    "Events Name": definition.get("events_name", ""),
+                    "Countries": definition.get("countries", ""),
+                    "Total_Users": to_number(totals_by_key.get(key, 0)),
+                    "_create_time": definition.get("create_time", ""),
+                }
+            )
+        summary_rows.sort(
+            key=lambda item: (
+                str(item.get("_create_time", "")),
+                str(item.get("Audien Name", "")).lower(),
+            ),
+            reverse=True,
+        )
+        for item in summary_rows:
+            item.pop("_create_time", None)
+        for report_date in report_dates:
+            by_date[report_date] = [dict(item) for item in summary_rows]
+        return by_date
+
+    @staticmethod
+    def personalized_dimensions(app: AppTarget) -> list[tuple[str, str]]:
+        return [
+            ("Country", "country"),
+            ("Language", "language"),
+            ("Device Category", "deviceCategory"),
+            ("Operating System", "operatingSystem"),
+            ("App Version", "appVersion"),
+            ("First User Medium", "firstUserMedium"),
+            ("Top Screens / Screen Class", app.screen_field),
+        ]
+
+    def run_dimension_session_report(
+        self,
+        app: AppTarget,
+        label: str,
+        dimension_name: str,
+        report_dates: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        by_date = {report_date: [] for report_date in report_dates}
+        page_size = 100000
+        offset = 0
+        while True:
+            request = RunReportRequest(
+                property=f"properties/{app.property_id}",
+                date_ranges=[
+                    DateRange(
+                        start_date=self.config.start_date,
+                        end_date=self.config.end_date,
+                    )
+                ],
+                dimensions=[Dimension(name="date"), Dimension(name=dimension_name)],
+                metrics=[
+                    Metric(name="activeUsers"),
+                    Metric(name="sessions"),
+                    Metric(name="averageSessionDuration"),
+                    Metric(name="engagementRate"),
+                ],
+                **self.report_filter(app),
+                order_bys=[self.date_order(), self.metric_order("activeUsers")],
+                limit=page_size,
+                offset=offset,
+            )
+            response = self.analytics.run_report(request)
+            page_rows = self.parse_response_rows(response)
+            if not page_rows:
+                break
+            for row in page_rows:
+                report_date = ga4_date_to_iso(row.get("date", ""))
+                if report_date not in by_date:
+                    continue
+                if len(by_date[report_date]) >= self.config.personalized_top_n:
+                    continue
+                by_date[report_date].append(
+                    {
+                        "label": label,
+                        "value": row.get(dimension_name, "") or "(not set)",
+                        "active": to_number(row.get("activeUsers", 0)),
+                        "sessions": to_number(row.get("sessions", 0)),
+                        "avg": format_seconds(row.get("averageSessionDuration", 0)),
+                        "engagement": percent(row.get("engagementRate", 0)),
+                    }
+                )
+            offset += len(page_rows)
+            total_rows = int(getattr(response, "row_count", 0) or 0)
+            if len(page_rows) < page_size or (total_rows and offset >= total_rows):
+                break
+        return by_date
+
+    def run_personalized_ux(
+        self,
+        app: AppTarget,
+        report_dates: list[str],
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        result: dict[str, dict[str, list[dict[str, Any]]]] = {
+            report_date: {} for report_date in report_dates
+        }
+        for label, dimension_name in self.personalized_dimensions(app):
+            try:
+                by_date = self.run_dimension_session_report(
+                    app,
+                    label,
+                    dimension_name,
+                    report_dates,
+                )
+                for report_date in report_dates:
+                    result[report_date][label] = by_date.get(report_date, [])
+            except Exception as exc:
+                LOGGER.warning(
+                    "Personalized UX %s unavailable for %s: %s",
+                    label,
+                    app.package_name,
+                    exc,
+                )
+                if not self.config.continue_on_error:
+                    raise
+                for report_date in report_dates:
+                    result[report_date][label] = []
+        return result
+
+    # -------------------------
+    # Firebase Remote Config
+    # -------------------------
+    def get_remote_config_template(self, project_id: str) -> dict[str, Any]:
+        project_id = str(project_id or "").strip()
+        if not project_id:
+            raise ValueError("Firebase Project ID is unavailable for this GA4 stream.")
+        if project_id in self.remote_config_cache:
+            return self.remote_config_cache[project_id]
+
+        project_path = f"projects/{project_id}"
+        legacy_url = (
+            f"{self.config.firebase_remote_config_api_base}/{project_path}/remoteConfig"
+        )
+        namespace_name = f"{project_path}/namespaces/{self.config.remote_config_namespace}/remoteConfig"
+        try:
+            template = self.rest.request_json(
+                "GET",
+                legacy_url,
+                params={"name": namespace_name},
+            )
+        except Exception:
+            namespace_url = (
+                f"{self.config.firebase_remote_config_api_base}/{namespace_name}"
+            )
+            template = self.rest.request_json("GET", namespace_url)
+        self.remote_config_cache[project_id] = template
+        return template
+
+    @staticmethod
+    def iter_remote_parameters(
+        template: Mapping[str, Any],
+    ) -> Iterator[tuple[str, dict[str, Any], str]]:
+        for key, parameter in (template.get("parameters", {}) or {}).items():
+            if isinstance(parameter, dict):
+                yield str(key), parameter, ""
+        for group_name, group_data in (
+            template.get("parameterGroups", {}) or {}
+        ).items():
+            if not isinstance(group_data, Mapping):
+                continue
+            for key, parameter in (group_data.get("parameters", {}) or {}).items():
+                if isinstance(parameter, dict):
+                    yield str(key), parameter, str(group_name)
+
+    @staticmethod
+    def format_remote_value(value_object: Any) -> str:
+        if value_object is None or value_object == "":
+            return ""
+        if isinstance(value_object, dict):
+            if "value" in value_object:
+                return str(value_object.get("value", ""))
+            if value_object.get("useInAppDefault") is True:
+                return "Use in-app default"
+        return json.dumps(value_object, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def remote_condition_map(template: Mapping[str, Any]) -> dict[str, str]:
+        return {
+            str(item.get("name", "") or ""): str(item.get("expression", "") or "")
+            for item in template.get("conditions", []) or []
+            if item.get("name")
         }
 
-        time_capping_items = remote_ab.get("time_capping_rows", []) or []
-        iap_screen_items = remote_ab.get("iap_screen_rows", []) or []
-        audience_items = audience_rows.get(report_date, []) or []
-        time_analysis_items = time_analysis.get(report_date, []) or []
-        retention_items = retention_data.get(report_date, []) or []
-        row_count = max(
-            [
-                1,
-                len(time_capping_items),
-                len(iap_screen_items),
-                len(audience_items),
-                len(time_analysis_items),
-                len(retention_items),
-            ]
-            + [len(items) for items in personalized_groups.values()]
+    @staticmethod
+    def extract_fetch_percent(condition_expression: str) -> str:
+        expression = str(condition_expression or "")
+        if not expression:
+            return ""
+        range_match = re.search(
+            r"percent\s+in\s*\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]",
+            expression,
+            flags=re.IGNORECASE,
         )
+        if range_match:
+            start = float(range_match.group(1))
+            end = float(range_match.group(2))
+            return f"{max(end - start, 0):g}%"
+        threshold_match = re.search(
+            r"percent\s*(?:<=|<|==)\s*(\d+(?:\.\d+)?)",
+            expression,
+            flags=re.IGNORECASE,
+        )
+        if threshold_match:
+            return f"{float(threshold_match.group(1)):g}%"
+        return ""
 
-        for index in range(row_count):
-            output_row = {header: "" for header in OUTPUT_HEADERS}
-            output_row["App Name"] = app.app_name
-            output_row["GA4 Property ID"] = app.property_id
-            output_row["GA4 Stream ID"] = app.ga4_stream_id
-            output_row["Firebase Project ID"] = app.firebase_project_id
-            output_row["Firebase Project Name"] = app.firebase_project_name
-            output_row["Firebase App ID"] = app.firebase_app_id
-            output_row["Package Name"] = package_name
-            output_row["Detected Home Screen"] = app.home_screen_name
-            output_row["Detected Screen Field"] = app.screen_field
-            output_row["Home Detection Method"] = app.home_detection_method
-            output_row["Date"] = report_date
+    @staticmethod
+    def format_last_published(version: Mapping[str, Any]) -> str:
+        update_time = str(version.get("updateTime", "") or "").strip()
+        update_user = version.get("updateUser", {}) or {}
+        publisher = str(
+            update_user.get("email", "") or update_user.get("name", "") or ""
+        ).strip()
+        if publisher and update_time:
+            return f"{publisher} | {update_time}"
+        return publisher or update_time
 
-            # Store date-level summary metrics only once, on the first compact
-            # row for this package and date.
-            if index == 0:
-                output_row.update(fcm_delivery.get(report_date, {}))
-                set_funnel_columns(output_row, report_date, app, event_data, home_data)
+    def find_remote_parameters(
+        self,
+        template: Mapping[str, Any],
+        keywords: str,
+    ) -> list[tuple[str, dict[str, Any], str]]:
+        keyword_values = [normalize(item) for item in split_csv(keywords)]
+        exact: list[tuple[str, dict[str, Any], str]] = []
+        fuzzy: list[tuple[str, dict[str, Any], str]] = []
+        for key, parameter, group_name in self.iter_remote_parameters(template):
+            normalized_key = normalize(key)
+            item = (key, parameter, group_name)
+            if normalized_key in keyword_values:
+                exact.append(item)
+            elif any(
+                keyword and keyword in normalized_key for keyword in keyword_values
+            ):
+                fuzzy.append(item)
+        matches = exact + [item for item in fuzzy if item not in exact]
+        return matches[: self.config.remote_parameter_limit]
 
-            if index < len(audience_items):
-                set_audience_columns(output_row, audience_items[index])
-            if index < len(time_analysis_items):
-                set_time_analysis_columns(output_row, time_analysis_items[index])
-            if index < len(retention_items):
-                set_retention_columns(output_row, retention_items[index])
-
-            # Time Capping and IAP parameter records are independent lists.
-            # They are aligned side by side by row index only to avoid gaps.
-            if index < len(time_capping_items):
-                set_ab_parameter_columns(output_row, "time_capping", time_capping_items[index])
-            if index < len(iap_screen_items):
-                set_ab_parameter_columns(output_row, "iap_screen", iap_screen_items[index])
-
-            # Fill each Personalized UX category independently at the same
-            # row index. Country row 1, Language row 1, Device Category row 1,
-            # and so on appear side by side without implying a relationship.
-            for _, slug in PERSONALIZED_COLUMN_SPECS:
-                items = personalized_groups.get(slug, [])
-                if index < len(items):
-                    set_personalized_columns(output_row, slug, items[index])
-
-            rows.append([output_row.get(header, "") for header in OUTPUT_HEADERS])
-    return rows
-
-
-
-def main():
-    print("Discovering all Android GA4 apps accessible to the service account...")
-    apps = discover_apps_from_service_account()
-    report_dates = get_report_dates()
-    print(f"Total accessible Android apps found: {len(apps)}")
-    print(f"Report date range: {report_dates[0]} to {report_dates[-1]}")
-
-    field_map = build_bigquery_field_map()
-    export_run_id = uuid.uuid4().hex
-    exported_at = datetime.now(timezone.utc).isoformat()
-    temp_path = ""
-    total_rows = 0
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            suffix=".ndjson",
-            prefix="ga4_bigquery_",
-            delete=False,
-        ) as temp_file:
-            temp_path = temp_file.name
-            for app in apps:
-                package_name = fetch_ga4_package_name(app)
-                if package_name:
-                    print(f"Package name found for {app.app_name}: {package_name}")
-                else:
-                    print(
-                        f"Package name not found for {app.app_name}; "
-                        "the BigQuery package_name field will be NULL."
-                    )
-                app_rows = build_rows_for_app(app, report_dates, package_name)
-                written = write_ndjson_records(
-                    temp_file,
-                    app_rows,
-                    field_map,
-                    exported_at,
-                    export_run_id,
+    def build_remote_parameter_rows(
+        self,
+        key: str,
+        parameter: Mapping[str, Any],
+        group_name: str,
+        condition_map: Mapping[str, str],
+        last_published: str,
+    ) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        display_name = key if not group_name else f"{group_name}/{key}"
+        if "defaultValue" in parameter:
+            value = self.format_remote_value(parameter.get("defaultValue"))
+            if value != "":
+                rows.append(
+                    {
+                        "name": display_name,
+                        "condition": "Default value",
+                        "value": value,
+                        "fetch_percent": "100%",
+                        "last_published": last_published,
+                    }
                 )
-                total_rows += written
-                print(f"Prepared {written:,} BigQuery rows for {app.app_name}.")
+        for condition_name, value_object in (
+            parameter.get("conditionalValues", {}) or {}
+        ).items():
+            value = self.format_remote_value(value_object)
+            if value == "":
+                continue
+            rows.append(
+                {
+                    "name": display_name,
+                    "condition": str(condition_name),
+                    "value": value,
+                    "fetch_percent": self.extract_fetch_percent(
+                        condition_map.get(str(condition_name), "")
+                    ),
+                    "last_published": last_published,
+                }
+            )
+        if not rows:
+            rows.append(
+                {
+                    "name": display_name,
+                    "condition": "",
+                    "value": "No configured value",
+                    "fetch_percent": "",
+                    "last_published": last_published,
+                }
+            )
+        return rows
 
-        table_id = load_ndjson_file_to_bigquery(temp_path, total_rows, field_map)
-        print(
-            f"Export finished successfully. Run ID: {export_run_id}; "
-            f"rows loaded: {total_rows:,}; table: {table_id}."
+    def get_remote_config_rows(self, app: AppTarget) -> dict[str, list[dict[str, str]]]:
+        empty = {"time_capping_rows": [], "iap_screen_rows": []}
+        if not app.firebase_project_id:
+            return empty
+        try:
+            template = self.get_remote_config_template(app.firebase_project_id)
+            condition_map = self.remote_condition_map(template)
+            last_published = self.format_last_published(
+                template.get("version", {}) or {}
+            )
+
+            time_rows: list[dict[str, str]] = []
+            for key, parameter, group in self.find_remote_parameters(
+                template,
+                self.config.time_capping_parameter_keywords,
+            ):
+                time_rows.extend(
+                    self.build_remote_parameter_rows(
+                        key,
+                        parameter,
+                        group,
+                        condition_map,
+                        last_published,
+                    )
+                )
+
+            iap_rows: list[dict[str, str]] = []
+            for key, parameter, group in self.find_remote_parameters(
+                template,
+                self.config.iap_screen_parameter_keywords,
+            ):
+                iap_rows.extend(
+                    self.build_remote_parameter_rows(
+                        key,
+                        parameter,
+                        group,
+                        condition_map,
+                        last_published,
+                    )
+                )
+
+            return {
+                "time_capping_rows": time_rows,
+                "iap_screen_rows": iap_rows,
+            }
+        except Exception as exc:
+            LOGGER.warning(
+                "Remote Config unavailable for %s: %s", app.package_name, exc
+            )
+            if not self.config.continue_on_error:
+                raise
+            return empty
+
+    # -------------------------
+    # FCM delivery data
+    # -------------------------
+    @staticmethod
+    def format_fcm_date(date_data: Mapping[str, Any]) -> str:
+        year = int(date_data.get("year", 0) or 0)
+        month = int(date_data.get("month", 0) or 0)
+        day = int(date_data.get("day", 0) or 0)
+        if year and month and day:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        return ""
+
+    def request_fcm_delivery_data(self, project_id: str, app_id: str) -> dict[str, Any]:
+        cache_key = (project_id, app_id)
+        if cache_key in self.fcm_delivery_cache:
+            return self.fcm_delivery_cache[cache_key]
+
+        def request(encode_colons: bool) -> dict[str, Any]:
+            project_part = quote(project_id, safe="-")
+            app_part = quote(app_id, safe="" if encode_colons else ":")
+            url = (
+                f"{self.config.fcm_data_api_base}/projects/{project_part}/"
+                f"androidApps/{app_part}/deliveryData"
+            )
+            rows: list[dict[str, Any]] = []
+            for item in self.rest.paginated_get(
+                url,
+                item_key="androidDeliveryData",
+                params={"pageSize": self.config.fcm_data_page_size},
+            ):
+                rows.append(item)
+            return {"androidDeliveryData": rows}
+
+        try:
+            payload = request(False)
+        except RuntimeError as exc:
+            if "400" not in str(exc) and "INVALID_ARGUMENT" not in str(exc):
+                raise
+            payload = request(True)
+        self.fcm_delivery_cache[cache_key] = payload
+        return payload
+
+    def build_fcm_fields_by_date(
+        self,
+        app: AppTarget,
+        report_dates: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        result = {report_date: {} for report_date in report_dates}
+        if not app.firebase_project_id or not app.firebase_app_id:
+            return result
+        try:
+            payload = self.request_fcm_delivery_data(
+                app.firebase_project_id,
+                app.firebase_app_id,
+            )
+            grouped: dict[str, list[dict[str, Any]]] = {
+                report_date: [] for report_date in report_dates
+            }
+            for delivery in payload.get("androidDeliveryData", []) or []:
+                delivery_date = self.format_fcm_date(delivery.get("date", {}) or {})
+                if delivery_date in grouped:
+                    grouped[delivery_date].append(delivery)
+
+            for report_date, items in grouped.items():
+                accepted_total = 0.0
+                delivered_weighted = 0.0
+                pending_weighted = 0.0
+                for item in items:
+                    data = item.get("data", {}) or {}
+                    accepted = max(to_float(data.get("countMessagesAccepted", 0)), 0.0)
+                    if accepted <= 0:
+                        continue
+                    outcomes = data.get("messageOutcomePercents", {}) or {}
+                    accepted_total += accepted
+                    delivered_weighted += accepted * to_float(
+                        outcomes.get("delivered", 0)
+                    )
+                    pending_weighted += accepted * to_float(outcomes.get("pending", 0))
+                if accepted_total <= 0:
+                    continue
+                result[report_date] = {
+                    "firebase_notifications_accepted": to_number(accepted_total),
+                    "firebase_delivered": f"{round(delivered_weighted / accepted_total, 2)}%",
+                    "firebase_pending": f"{round(pending_weighted / accepted_total, 2)}%",
+                }
+            return result
+        except Exception as exc:
+            LOGGER.warning(
+                "FCM delivery data unavailable for %s: %s", app.package_name, exc
+            )
+            if not self.config.continue_on_error:
+                raise
+            return result
+
+    # -------------------------
+    # Row assembly
+    # -------------------------
+    @staticmethod
+    def get_event_metric(
+        event_data: Mapping[tuple[str, str], Mapping[str, Any]],
+        report_date: str,
+        event_name: str,
+    ) -> Mapping[str, Any]:
+        return event_data.get((report_date, event_name), {}) or {}
+
+    def pick_first_available_event(
+        self,
+        event_data: Mapping[tuple[str, str], Mapping[str, Any]],
+        report_date: str,
+        event_names: list[str],
+    ) -> tuple[str, Mapping[str, Any]]:
+        for event_name in event_names:
+            data = self.get_event_metric(event_data, report_date, event_name)
+            if to_float(data.get("active_users", 0)) or to_float(
+                data.get("event_count", 0)
+            ):
+                return event_name, data
+        if event_names:
+            first = event_names[0]
+            return first, self.get_event_metric(event_data, report_date, first)
+        return "", {}
+
+    def get_home_metrics_for_date(
+        self,
+        report_date: str,
+        app: AppTarget,
+        event_data: Mapping[tuple[str, str], Mapping[str, Any]],
+        home_data: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[str, int | float, int | float]:
+        home_events = split_csv(app.home_event_names)
+        if home_events:
+            home_event, data = self.pick_first_available_event(
+                event_data,
+                report_date,
+                home_events,
+            )
+            home_users = to_number(data.get("active_users", 0))
+            home_views = to_number(data.get("event_count", 0))
+            if to_float(home_users) or to_float(home_views):
+                return home_event, home_users, home_views
+
+        # With no Apps Config sheet, home-event inference is necessarily
+        # heuristic. Fall back to the inferred home screen when no custom home
+        # event fired on this date.
+        data = home_data.get(report_date, {}) or {}
+        return (
+            "screen_view",
+            to_number(data.get("active_users", 0)),
+            to_number(data.get("event_count", 0)),
         )
-    finally:
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
+
+    @staticmethod
+    def set_audience_columns(row: dict[str, Any], item: Mapping[str, Any]) -> None:
+        row["Audien Name"] = item.get("Audien Name", "")
+        row["Events Name"] = item.get("Events Name", "")
+        row["Countries"] = item.get("Countries", "")
+        row["Total_Users"] = item.get("Total_Users", 0)
+
+    def set_funnel_columns(
+        self,
+        row: dict[str, Any],
+        report_date: str,
+        app: AppTarget,
+        event_data: Mapping[tuple[str, str], Mapping[str, Any]],
+        home_data: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        _, app_open_data = self.pick_first_available_event(
+            event_data,
+            report_date,
+            split_csv(app.app_open_event_names),
+        )
+        app_open_users = to_number(app_open_data.get("active_users", 0))
+        app_open_events = to_number(app_open_data.get("event_count", 0))
+        _, home_users, home_views = self.get_home_metrics_for_date(
+            report_date,
+            app,
+            event_data,
+            home_data,
+        )
+
+        row["funnel_app_open_users"] = app_open_users
+        row["funnel_app_open_events"] = app_open_events
+        row["funnel_home_users"] = home_users
+        row["funnel_home_events_views"] = home_views
+        row["funnel_possible_drop_off"] = max(
+            int(to_float(app_open_users) - to_float(home_users)),
+            0,
+        )
+        row["funnel_home_reach_rate"] = rate(home_users, app_open_users)
+
+        for event_name, slug in (
+            ("ad_impression", "ad_impression"),
+            ("in_app_purchase", "in_app_purchase"),
+        ):
+            data = self.get_event_metric(event_data, report_date, event_name)
+            row[f"funnel_{slug}_events"] = to_number(data.get("event_count", 0))
+            row[f"funnel_{slug}_users"] = to_number(data.get("active_users", 0))
+
+    @staticmethod
+    def set_remote_parameter_columns(
+        row: dict[str, Any],
+        prefix: str,
+        item: Mapping[str, Any],
+    ) -> None:
+        row[f"{prefix}_name"] = item.get("name", "")
+        row[f"{prefix}_condition"] = item.get("condition", "")
+        row[f"{prefix}_value"] = item.get("value", "")
+        row[f"{prefix}_fetch_percent"] = item.get("fetch_percent", "")
+        row[f"{prefix}_last_published"] = item.get("last_published", "")
+
+    @staticmethod
+    def set_time_analysis_columns(
+        row: dict[str, Any],
+        metrics: Mapping[str, Any],
+    ) -> None:
+        row["time_analysis_country"] = metrics.get("Country", "")
+        row["time_analysis_active_users"] = metrics.get("Active Users", 0)
+        row["time_analysis_new_users"] = metrics.get("New Users", 0)
+        row["time_analysis_sessions"] = metrics.get("Sessions", 0)
+        row["time_analysis_engaged_sessions"] = metrics.get("Engaged Sessions", 0)
+        row["time_analysis_engagement_rate"] = metrics.get("Engagement Rate", "0%")
+        row["time_analysis_avg_session_duration"] = metrics.get(
+            "Avg Session Duration", "0m 0s"
+        )
+        row["time_analysis_sessions_per_active_user"] = metrics.get(
+            "Sessions Per Active User", 0
+        )
+        row["time_analysis_total_engagement_time"] = metrics.get(
+            "Total Engagement Time", "0m 0s"
+        )
+
+    @staticmethod
+    def set_retention_columns(
+        row: dict[str, Any],
+        retention: Mapping[str, Any],
+    ) -> None:
+        row["retention_cohort_date"] = retention.get("Cohort Date", "")
+        row["retention_country"] = retention.get("Country", "")
+        row["retention_d1_first_session_retention"] = retention.get(
+            "D1 Retention", "Not available"
+        )
+        row["retention_d3_first_session_retention"] = retention.get(
+            "D3 Retention", "Not available"
+        )
+        row["retention_d7_first_session_retention"] = retention.get(
+            "D7 Retention", "Not available"
+        )
+        row["retention_d30_first_session_retention"] = retention.get(
+            "D30 Retention", "Not available"
+        )
+
+    @staticmethod
+    def set_personalized_columns(
+        row: dict[str, Any],
+        slug: str,
+        item: Mapping[str, Any],
+    ) -> None:
+        row[f"personalized_category_{slug}"] = item.get("value", "")
+        row[f"personalized_{slug}_users"] = item.get("active", 0)
+        row[f"personalized_{slug}_sessions"] = item.get("sessions", 0)
+        row[f"personalized_{slug}_er"] = item.get("engagement", "")
+        row[f"personalized_{slug}_avg"] = item.get("avg", "")
+
+    def build_rows_for_app(
+        self,
+        app: AppTarget,
+        report_dates: list[str],
+    ) -> list[dict[str, Any]]:
+        LOGGER.info(
+            "Processing %s | property=%s | stream=%s | dates=%s..%s",
+            app.package_name,
+            app.property_id,
+            app.ga4_stream_id,
+            report_dates[0],
+            report_dates[-1],
+        )
+
+        app_open_events = split_csv(app.app_open_event_names)
+        home_events = split_csv(app.home_event_names)
+        event_names = [
+            event_name
+            for event_name in dict.fromkeys(
+                app_open_events + home_events + ["ad_impression", "in_app_purchase"]
+            )
+            if event_name and event_name.lower() not in EXCLUDED_GA4_EVENT_NAMES
+        ]
+
+        time_analysis: dict[str, list[dict[str, Any]]] = {
+            report_date: [] for report_date in report_dates
+        }
+        event_data: dict[tuple[str, str], dict[str, Any]] = {}
+        home_data: dict[str, dict[str, Any]] = {}
+        retention_data: dict[str, list[dict[str, Any]]] = {
+            report_date: [] for report_date in report_dates
+        }
+        audience_rows: dict[str, list[dict[str, Any]]] = {
+            report_date: [] for report_date in report_dates
+        }
+        personalized_ux: dict[str, dict[str, list[dict[str, Any]]]] = {
+            report_date: {} for report_date in report_dates
+        }
+        fcm_delivery: dict[str, dict[str, Any]] = {
+            report_date: {} for report_date in report_dates
+        }
+        remote_config_rows = {"time_capping_rows": [], "iap_screen_rows": []}
+
+        tasks: list[tuple[str, Any]] = [
+            ("time analysis", lambda: self.run_time_analysis_report(app)),
+            ("events", lambda: self.run_event_report(app, event_names)),
+            ("home screen", lambda: self.run_home_screen_report(app)),
+            ("retention", lambda: self.run_retention_report(app, report_dates)),
+            ("audiences", lambda: self.run_audience_report(app, report_dates)),
+            ("personalized UX", lambda: self.run_personalized_ux(app, report_dates)),
+            ("FCM delivery", lambda: self.build_fcm_fields_by_date(app, report_dates)),
+            ("Remote Config", lambda: self.get_remote_config_rows(app)),
+        ]
+        for task_name, task in tasks:
+            try:
+                result = task()
+                if task_name == "time analysis":
+                    time_analysis = result
+                elif task_name == "events":
+                    event_data = result
+                elif task_name == "home screen":
+                    home_data = result
+                elif task_name == "retention":
+                    retention_data = result
+                elif task_name == "audiences":
+                    audience_rows = result
+                elif task_name == "personalized UX":
+                    personalized_ux = result
+                elif task_name == "FCM delivery":
+                    fcm_delivery = result
+                elif task_name == "Remote Config":
+                    remote_config_rows = result
+            except Exception as exc:
+                LOGGER.warning(
+                    "%s failed for %s (%s/%s): %s",
+                    task_name,
+                    app.package_name,
+                    app.property_id,
+                    app.ga4_stream_id,
+                    exc,
+                )
+                if not self.config.continue_on_error:
+                    raise
+
+        rows: list[dict[str, Any]] = []
+        for report_date in report_dates:
+            personalized_for_date = personalized_ux.get(report_date, {}) or {}
+            personalized_groups: dict[str, list[dict[str, Any]]] = {
+                slug: personalized_for_date.get(category, []) or []
+                for category, slug in PERSONALIZED_COLUMN_SPECS
+            }
+
+            time_capping_items = remote_config_rows.get("time_capping_rows", []) or []
+            iap_screen_items = remote_config_rows.get("iap_screen_rows", []) or []
+            audience_items = audience_rows.get(report_date, []) or []
+            time_analysis_items = time_analysis.get(report_date, []) or []
+            retention_items = retention_data.get(report_date, []) or []
+
+            row_count = max(
+                [
+                    1,
+                    len(time_capping_items),
+                    len(iap_screen_items),
+                    len(audience_items),
+                    len(time_analysis_items),
+                    len(retention_items),
+                ]
+                + [len(items) for items in personalized_groups.values()]
+            )
+
+            for index in range(row_count):
+                row: dict[str, Any] = {header: None for header in OUTPUT_HEADERS}
+                row["Package Name"] = app.package_name
+                row["Date"] = report_date
+
+                # Date-level metrics appear once per package/date. The other
+                # datasets are independent lists compacted side-by-side.
+                if index == 0:
+                    row.update(fcm_delivery.get(report_date, {}) or {})
+                    self.set_funnel_columns(
+                        row,
+                        report_date,
+                        app,
+                        event_data,
+                        home_data,
+                    )
+
+                if index < len(audience_items):
+                    self.set_audience_columns(row, audience_items[index])
+                if index < len(time_analysis_items):
+                    self.set_time_analysis_columns(row, time_analysis_items[index])
+                if index < len(retention_items):
+                    self.set_retention_columns(row, retention_items[index])
+                if index < len(time_capping_items):
+                    self.set_remote_parameter_columns(
+                        row,
+                        "time_capping",
+                        time_capping_items[index],
+                    )
+                if index < len(iap_screen_items):
+                    self.set_remote_parameter_columns(
+                        row,
+                        "iap_screen",
+                        iap_screen_items[index],
+                    )
+                for _, slug in PERSONALIZED_COLUMN_SPECS:
+                    items = personalized_groups.get(slug, [])
+                    if index < len(items):
+                        self.set_personalized_columns(row, slug, items[index])
+
+                rows.append(row)
+        return rows
+
+
+class BigQueryWriter:
+    def __init__(
+        self,
+        config: Config,
+        credentials: Credentials,
+        project_id: str,
+    ) -> None:
+        self.config = config
+        self.project_id = project_id
+        self.client = bigquery.Client(
+            project=project_id,
+            credentials=credentials,
+            location=config.bigquery_location,
+        )
+        self.dataset_ref = bigquery.DatasetReference(
+            project_id,
+            config.bigquery_dataset_id,
+        )
+        self.table_ref = self.dataset_ref.table(config.bigquery_table_id)
+        self.table_id = (
+            f"{project_id}.{config.bigquery_dataset_id}.{config.bigquery_table_id}"
+        )
+
+    def prepare(self) -> None:
+        dataset = bigquery.Dataset(self.dataset_ref)
+        dataset.location = self.config.bigquery_location
+        self.client.create_dataset(dataset, exists_ok=True)
+
+        if self.config.bigquery_write_disposition == "WRITE_TRUNCATE":
+            self.client.delete_table(self.table_ref, not_found_ok=True)
+
+        try:
+            self.client.get_table(self.table_ref)
+        except NotFound:
+            table = bigquery.Table(self.table_ref, schema=BIGQUERY_SCHEMA)
+            table.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field="Date",
+            )
+            table.description = (
+                "GA4 and Firebase analytics for all accessible Android app streams. "
+                "Generated without an Apps Config spreadsheet."
+            )
+            self.client.create_table(table)
+
+    @staticmethod
+    def normalize_row(row: Mapping[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for field in BIGQUERY_SCHEMA:
+            value = row.get(field.name)
+            if value in {"", None}:
+                normalized[field.name] = None
+                continue
+            if field.field_type in {"INTEGER", "INT64"}:
+                normalized[field.name] = int(round(to_float(value)))
+            elif field.field_type in {"FLOAT", "FLOAT64"}:
+                normalized[field.name] = float(value)
+            else:
+                normalized[field.name] = str(value)
+        return normalized
+
+    def write_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        chunk_size: int = 5000,
+    ) -> int:
+        buffer: list[dict[str, Any]] = []
+        total = 0
+
+        def flush() -> None:
+            nonlocal total
+            if not buffer:
+                return
+            job_config = bigquery.LoadJobConfig(
+                schema=BIGQUERY_SCHEMA,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+                create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
+            )
+            load_job = self.client.load_table_from_json(
+                list(buffer),
+                self.table_ref,
+                job_config=job_config,
+                location=self.config.bigquery_location,
+            )
+            load_job.result()
+            if load_job.errors:
+                raise RuntimeError(f"BigQuery load errors: {load_job.errors}")
+            total += len(buffer)
+            LOGGER.info("Loaded %d rows into %s", total, self.table_id)
+            buffer.clear()
+
+        for row in rows:
+            buffer.append(self.normalize_row(row))
+            if len(buffer) >= chunk_size:
+                flush()
+        flush()
+        return total
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def main() -> int:
+    configure_logging()
+    try:
+        config = load_config()
+        credentials = load_credentials(config.service_account_json)
+        project_id = config.bigquery_project_id or credentials_project_id(
+            credentials,
+            config.service_account_json,
+        )
+        if not project_id:
+            raise ValueError(
+                "BIGQUERY_PROJECT_ID is required because a project_id could not "
+                "be derived from the service-account JSON."
+            )
+
+        report_dates = get_report_dates(config)
+        LOGGER.info("Report date range: %s to %s", report_dates[0], report_dates[-1])
+
+        pipeline = Pipeline(config, credentials)
+        apps = pipeline.discover_apps()
+        LOGGER.info("Total accessible Android app streams: %d", len(apps))
+
+        writer = BigQueryWriter(config, credentials, project_id)
+        writer.prepare()
+
+        total_rows = 0
+        for app in apps:
+            try:
+                pipeline.infer_ga4_app_configuration(app)
+                app_rows = pipeline.build_rows_for_app(app, report_dates)
+                total_rows += writer.write_rows(app_rows)
+            except Exception as exc:
+                LOGGER.exception(
+                    "App failed: %s | property=%s | stream=%s | %s",
+                    app.package_name,
+                    app.property_id,
+                    app.ga4_stream_id,
+                    exc,
+                )
+                if not config.continue_on_error:
+                    raise
+
+        LOGGER.info(
+            "Completed: %d rows written to %s",
+            total_rows,
+            writer.table_id,
+        )
+        return 0
+    except Exception as exc:
+        LOGGER.exception("Pipeline failed: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
