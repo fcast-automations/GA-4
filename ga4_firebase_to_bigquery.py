@@ -551,41 +551,61 @@ class Pipeline:
         self, projects: Iterable[FirebaseProject]
     ) -> list[FirebaseApp]:
         apps: list[FirebaseApp] = []
+
         for project in projects:
             url = (
                 f"{self.config.firebase_management_api_base}/projects/"
-                f"{project.project_id}:searchApps"
+                f"{project.project_id}/androidApps"
             )
+
+            LOGGER.info(
+                "Checking Firebase Android apps in project: %s (%s)",
+                project.project_id,
+                project.display_name,
+            )
+
             try:
                 items = list(
                     self.rest.paginated_get(
                         url,
                         item_key="apps",
-                        params={"pageSize": 100, "filter": "platform=ANDROID"},
+                        params={"pageSize": 100},
                     )
                 )
             except Exception as exc:
                 LOGGER.warning(
-                    "Firebase apps unavailable for %s: %s", project.project_id, exc
+                    "Firebase Android apps unavailable for %s: %s",
+                    project.project_id,
+                    exc,
                 )
                 continue
+
+            LOGGER.info(
+                "Firebase project %s returned %d Android apps",
+                project.project_id,
+                len(items),
+            )
+
             for item in items:
-                if str(item.get("platform", "") or "").strip() != "ANDROID":
-                    continue
                 app_id = str(item.get("appId", "") or "").strip()
-                namespace = str(item.get("namespace", "") or "").strip()
+                package_name = str(item.get("packageName", "") or "").strip()
+
                 if not app_id:
                     continue
+
                 apps.append(
                     FirebaseApp(
                         app_id=app_id,
                         project_id=project.project_id,
                         project_name=project.display_name,
-                        display_name=str(item.get("displayName", "") or "").strip(),
+                        display_name=str(
+                            item.get("displayName", "") or ""
+                        ).strip(),
                         platform="ANDROID",
-                        namespace=namespace,
+                        namespace=package_name,
                     )
                 )
+
         return apps
 
     def discover_apps(self) -> list[AppTarget]:
