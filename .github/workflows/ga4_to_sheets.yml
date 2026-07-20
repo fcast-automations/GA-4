@@ -45,7 +45,7 @@ jobs:
           BIGQUERY_WRITE_DISPOSITION: ${{ vars.BIGQUERY_WRITE_DISPOSITION || 'WRITE_TRUNCATE' }}
 
           START_DATE: ${{ vars.START_DATE || '7daysAgo' }}
-          END_DATE: ${{ vars.END_DATE || 'yesterday' }}
+          END_DATE: ${{ vars.END_DATE || 'today' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
