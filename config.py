@@ -113,10 +113,10 @@ def load_config() -> Config:
         timezone=optional_env("TIMEZONE", "Asia/Karachi"),
         personalized_top_n=max(optional_int_env("PERSONALIZED_TOP_N", 5), 1),
         default_home_screen_name=optional_env(
-            "DEFAULT_HOME_SCREEN_NAME", "MainActivity"
+             "DEFAULT_HOME_SCREEN_NAME", ""
         ),
-        default_screen_field=optional_env(
-            "DEFAULT_SCREEN_FIELD", "unifiedPagePathScreen"
+         default_screen_field=optional_env(
+            "DEFAULT_SCREEN_FIELD", ""
         ),
         screen_field_candidates=optional_env(
             "SCREEN_FIELD_CANDIDATES",
