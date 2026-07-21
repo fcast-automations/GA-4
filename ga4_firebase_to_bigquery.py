@@ -58,9 +58,9 @@ FCM_COLUMNS = [
 
 
 def build_output_headers() -> list[str]:
-    headers = ["Package Name", "Date"]
+    headers = ["Package_Name", "Date"]
     headers.extend(FCM_COLUMNS)
-    headers.extend(["Audien Name", "Events Name", "Countries", "Total_Users"])
+    headers.extend(["Audience_Name", "Events_Name", "Countries", "Total_Users"])
     headers.extend(
         [
             "funnel_app_open_users",
