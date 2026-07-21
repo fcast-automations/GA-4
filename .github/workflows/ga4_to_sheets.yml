@@ -49,8 +49,7 @@ jobs:
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Karachi' }}
 
           PERSONALIZED_TOP_N: ${{ vars.PERSONALIZED_TOP_N || '5' }}
-          DEFAULT_HOME_SCREEN_NAME: ${{ vars.DEFAULT_HOME_SCREEN_NAME || 'MainActivity' }}
-          DEFAULT_SCREEN_FIELD: ${{ vars.DEFAULT_SCREEN_FIELD || 'unifiedPagePathScreen' }}
+          
           SCREEN_FIELD_CANDIDATES: ${{ vars.SCREEN_FIELD_CANDIDATES || 'unifiedPagePathScreen,unifiedScreenName,unifiedScreenClass,screenName,screenClass' }}
           HOME_SCREEN_KEYWORDS: ${{ vars.HOME_SCREEN_KEYWORDS || 'home,main,dashboard,landing,start' }}
           APP_OPEN_EVENT_NAMES: ${{ vars.APP_OPEN_EVENT_NAMES || 'session_start,app_open,first_open' }}
