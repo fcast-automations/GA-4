@@ -5,7 +5,7 @@ import logging
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -222,6 +222,7 @@ EXCLUDED_GA4_EVENT_NAMES = {
 }
 
 RETENTION_DAY_OFFSETS = (1, 3, 7, 30)
+HISTORY_DAYS_TO_PRESERVE = 6
 
 
 @dataclass(frozen=True)
@@ -333,6 +334,19 @@ def resolve_ga4_date(value: str, timezone: str) -> str:
     raise ValueError(
         f"Unsupported GA4 date '{value}'. Use YYYY-MM-DD, today, yesterday, or NdaysAgo."
     )
+
+
+
+def configure_today_refresh(config: Config) -> tuple[Config, str]:
+    """Return a config whose report range is today in the configured timezone."""
+    today = datetime.now(ZoneInfo(config.timezone)).date().isoformat()
+    try:
+        return replace(config, start_date=today, end_date=today), today
+    except TypeError:
+        # Fallback for a non-dataclass Config implementation.
+        setattr(config, "start_date", today)
+        setattr(config, "end_date", today)
+        return config, today
 
 
 def get_report_dates(config: Config) -> list[str]:
@@ -2078,7 +2092,7 @@ class Pipeline:
 
 
 class BigQueryWriter:
-    """Stage all rows first, then publish the complete table in one copy job."""
+    """Preserve six completed days, stage today, then publish atomically."""
 
     def __init__(
         self,
@@ -2146,6 +2160,78 @@ class BigQueryWriter:
             "Live table %s will remain unchanged until every app is processed",
             self.table_id,
         )
+
+    def preserve_previous_days(
+        self,
+        refresh_date: str,
+        *,
+        days_to_preserve: int = HISTORY_DAYS_TO_PRESERVE,
+    ) -> int:
+        """
+        Copy the completed days immediately before refresh_date from the live
+        table into staging. Today's existing rows are intentionally excluded.
+        """
+        try:
+            live_table = self.client.get_table(self.table_ref)
+        except NotFound:
+            LOGGER.info(
+                "Live table %s does not exist; no previous days to preserve",
+                self.table_id,
+            )
+            return 0
+
+        required_columns = [field.name for field in BIGQUERY_SCHEMA]
+        live_columns = {field.name for field in live_table.schema}
+        missing_columns = [
+            column for column in required_columns if column not in live_columns
+        ]
+        if missing_columns:
+            raise RuntimeError(
+                "The live table schema is missing required column(s): "
+                + ", ".join(missing_columns)
+            )
+
+        refresh_day = datetime.fromisoformat(refresh_date).date()
+        preserve_start = refresh_day - timedelta(days=days_to_preserve)
+        preserve_end = refresh_day - timedelta(days=1)
+
+        quoted_columns = ", ".join(f"`{column}`" for column in required_columns)
+        sql = f"""
+        INSERT INTO `{self.staging_table_id}` ({quoted_columns})
+        SELECT {quoted_columns}
+        FROM `{self.table_id}`
+        WHERE Date BETWEEN @preserve_start AND @preserve_end
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "preserve_start",
+                    "DATE",
+                    preserve_start,
+                ),
+                bigquery.ScalarQueryParameter(
+                    "preserve_end",
+                    "DATE",
+                    preserve_end,
+                ),
+            ]
+        )
+        query_job = self.client.query(
+            sql,
+            job_config=job_config,
+            location=self.config.bigquery_location,
+        )
+        query_job.result()
+        preserved_rows = int(query_job.num_dml_affected_rows or 0)
+
+        LOGGER.info(
+            "Preserved %d existing row(s) for %s through %s",
+            preserved_rows,
+            preserve_start.isoformat(),
+            preserve_end.isoformat(),
+        )
+        return preserved_rows
 
     @staticmethod
     def normalize_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2247,7 +2333,8 @@ def configure_logging() -> None:
 def main() -> int:
     configure_logging()
     try:
-        config = load_config()
+        base_config = load_config()
+        config, refresh_date = configure_today_refresh(base_config)
         credentials = load_credentials(config.service_account_json)
         project_id = config.bigquery_project_id or credentials_project_id(
             credentials,
@@ -2259,8 +2346,12 @@ def main() -> int:
                 "be derived from the service-account JSON."
             )
 
-        report_dates = get_report_dates(config)
-        LOGGER.info("Report date range: %s to %s", report_dates[0], report_dates[-1])
+        report_dates = [refresh_date]
+        LOGGER.info(
+            "Refreshing today only: %s; preserving the previous %d completed days",
+            refresh_date,
+            HISTORY_DAYS_TO_PRESERVE,
+        )
 
         pipeline = Pipeline(config, credentials)
         apps = pipeline.discover_apps()
@@ -2268,6 +2359,7 @@ def main() -> int:
 
         writer = BigQueryWriter(config, credentials, project_id)
         writer.prepare()
+        preserved_rows = writer.preserve_previous_days(refresh_date)
 
         total_rows = 0
         failed_apps: list[str] = []
@@ -2308,7 +2400,9 @@ def main() -> int:
             writer.cleanup()
 
         LOGGER.info(
-            "Completed: %d rows published together to %s",
+            "Completed atomic refresh: %d preserved row(s) + %d refreshed row(s) "
+            "published together to %s",
+            preserved_rows,
             total_rows,
             writer.table_id,
         )
